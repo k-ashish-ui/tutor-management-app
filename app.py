@@ -106,16 +106,24 @@ def authenticate_tutor(tutor_id, password):
     if tutors_df is None or tutors_df.empty:
         return False, "Cannot access Tutors database"
     
+    # Check if required columns exist
+    if 'Tutor_ID' not in tutors_df.columns:
+        return False, "Tutors sheet missing 'Tutor_ID' column"
+    
+    if 'Password' not in tutors_df.columns:
+        return False, f"Tutors sheet missing 'Password' column. Found columns: {', '.join(tutors_df.columns)}"
+    
     # Find tutor
-    tutor = tutors_df[tutors_df['Tutor_ID'].astype(str) == str(tutor_id)]
+    tutor = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == str(tutor_id).strip()]
     
     if tutor.empty:
         return False, "Invalid Tutor ID"
     
     # Check password
-    if str(tutor.iloc[0]['Password']) == str(password):
-        tutor_name = tutor.iloc[0].get('Name', tutor_id)
-        return True, tutor_name
+    stored_password = str(tutor.iloc[0]['Password']).strip()
+    if stored_password == str(password).strip():
+        tutor_name = tutor.iloc[0].get('Name', tutor_id) if 'Name' in tutor.columns else tutor_id
+        return True, str(tutor_name)
     else:
         return False, "Invalid password"
 
@@ -244,6 +252,19 @@ def show_login():
                         st.error(result)
         
         st.markdown("---")
+        
+        # Debug section
+        with st.expander("🔍 Debug Info (Click if login fails)"):
+            if st.button("Check Tutors Sheet"):
+                tutors_df = load_sheet_data("Tutors")
+                if tutors_df is not None:
+                    st.success(f"✅ Tutors sheet found with {len(tutors_df)} rows")
+                    st.write("**Columns found:**", list(tutors_df.columns))
+                    st.write("**Sample data (first 3 rows):**")
+                    st.dataframe(tutors_df.head(3))
+                else:
+                    st.error("❌ Cannot access Tutors sheet")
+        
         st.info("💡 **First time setup required:**\n\n1. Create a 'Tutors' sheet with columns: Tutor_ID, Password, Name\n2. Add your credentials there\n3. Configure Google Sheets API (see deployment guide)")
 
 # Dashboard
