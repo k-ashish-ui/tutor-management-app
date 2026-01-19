@@ -92,9 +92,29 @@ def load_sheet_data(sheet_name):
             return None
         
         spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
-        worksheet = spreadsheet.worksheet(sheet_name)
+        
+        # Try to get the worksheet
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            # If exact name not found, try to find similar names
+            all_sheets = [ws.title for ws in spreadsheet.worksheets()]
+            # Try with stripped spaces
+            for ws_name in all_sheets:
+                if ws_name.strip() == sheet_name.strip():
+                    worksheet = spreadsheet.worksheet(ws_name)
+                    break
+            else:
+                st.error(f"Sheet '{sheet_name}' not found. Available sheets: {', '.join(all_sheets)}")
+                return None
+        
         data = worksheet.get_all_records()
-        return pd.DataFrame(data)
+        df = pd.DataFrame(data)
+        
+        # Clean column names - strip whitespace
+        df.columns = df.columns.str.strip()
+        
+        return df
     except Exception as e:
         st.error(f"Error loading {sheet_name}: {str(e)}")
         return None
@@ -135,13 +155,20 @@ def get_tutor_classes(tutor_id):
         return pd.DataFrame()
     
     # Filter by tutor ID
-    tutor_classes = schedule_df[schedule_df['Tutor_ID'].astype(str) == str(tutor_id)].copy()
+    tutor_classes = schedule_df[schedule_df['Tutor_ID'].astype(str).str.strip() == str(tutor_id).strip()].copy()
     
-    # Get student names
+    # Get student names - try both "Students " and "Students"
     students_df = load_sheet_data("Students ")
+    if students_df is None or students_df.empty:
+        students_df = load_sheet_data("Students")
+    
     if students_df is not None and not students_df.empty:
-        student_map = dict(zip(students_df['Student_ID'].astype(str), students_df['Student_Name']))
-        tutor_classes['Student_Name'] = tutor_classes['Student_ID'].astype(str).map(student_map)
+        # Clean the student IDs for matching
+        student_map = dict(zip(
+            students_df['Student_ID'].astype(str).str.strip(), 
+            students_df['Student_Name'].astype(str).str.strip()
+        ))
+        tutor_classes['Student_Name'] = tutor_classes['Student_ID'].astype(str).str.strip().map(student_map)
     
     return tutor_classes
 
@@ -171,19 +198,29 @@ def get_student_plan(student_id):
     if plan_df is None or curriculum_df is None:
         return pd.DataFrame()
     
-    # Filter by student
-    student_plan = plan_df[plan_df['Student_ID'].astype(str) == str(student_id)].copy()
+    # Filter by student - handle string comparison properly
+    student_plan = plan_df[plan_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()].copy()
     
     # Join with curriculum to get topic names
     if not curriculum_df.empty:
-        curriculum_map = dict(zip(curriculum_df['Topic_ID'].astype(str), curriculum_df['Sub_Unit_Name']))
-        unit_map = dict(zip(curriculum_df['Topic_ID'].astype(str), curriculum_df['Unit_Name']))
-        link_map = dict(zip(curriculum_df['Topic_ID'].astype(str), curriculum_df['Textbook_Ref']))
+        curriculum_map = dict(zip(
+            curriculum_df['Topic_ID'].astype(str).str.strip(), 
+            curriculum_df['Sub_Unit_Name'].astype(str).str.strip()
+        ))
+        unit_map = dict(zip(
+            curriculum_df['Topic_ID'].astype(str).str.strip(), 
+            curriculum_df['Unit_Name'].astype(str).str.strip()
+        ))
+        link_map = dict(zip(
+            curriculum_df['Topic_ID'].astype(str).str.strip(), 
+            curriculum_df['Textbook_Ref'].astype(str).str.strip()
+        ))
         
-        student_plan['Sub_Unit_Name'] = student_plan['Topic_ID'].astype(str).map(curriculum_map)
-        student_plan['Unit_Name'] = student_plan['Topic_ID'].astype(str).map(unit_map)
+        student_plan['Sub_Unit_Name'] = student_plan['Topic_ID'].astype(str).str.strip().map(curriculum_map)
+        student_plan['Unit_Name'] = student_plan['Topic_ID'].astype(str).str.strip().map(unit_map)
         student_plan['Content_Link'] = student_plan.apply(
-            lambda row: row.get('Topic_Content', '') or link_map.get(str(row['Topic_ID']), ''),
+            lambda row: row.get('Topic_Content', '') if pd.notna(row.get('Topic_Content')) and str(row.get('Topic_Content')).strip() 
+                       else link_map.get(str(row['Topic_ID']).strip(), ''),
             axis=1
         )
     
