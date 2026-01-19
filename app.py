@@ -83,7 +83,7 @@ def get_google_sheets_client():
         st.error(f"Error connecting to Google Sheets: {str(e)}")
         return None
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+@st.cache_data(ttl=60)  # Cache for only 1 minute
 def load_sheet_data(sheet_name):
     """Load data from a specific sheet"""
     try:
@@ -252,8 +252,9 @@ def mark_topic_complete(plan_id, tutor_id):
                 worksheet.update_cell(row_num, completed_by_col, tutor_id)
                 worksheet.update_cell(row_num, date_col, datetime.now().strftime('%d/%m/%Y'))
                 
-                # Clear cache
-                load_sheet_data.clear()
+                # Clear cache to force refresh
+                st.cache_data.clear()
+                
                 return True, "Topic marked as completed!"
         
         return False, "Plan ID not found"
@@ -307,10 +308,15 @@ def show_login():
 # Dashboard
 def show_dashboard():
     # Header
-    col1, col2 = st.columns([3, 1])
+    col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         st.markdown(f'<div class="main-header"><h1>📚 My Classes</h1><p>Welcome back, {st.session_state.tutor_name}!</p></div>', unsafe_allow_html=True)
     with col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 Refresh", use_container_width=True):
+            load_sheet_data.clear()
+            st.rerun()
+    with col3:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🚪 Logout", use_container_width=True):
             st.session_state.logged_in = False
@@ -375,9 +381,17 @@ def show_class_card(cls):
 
 # Student Plan View
 def show_student_plan():
-    if st.button("← Back to Dashboard"):
-        st.session_state.current_view = 'dashboard'
-        st.rerun()
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        if st.button("← Back to Dashboard"):
+            st.session_state.current_view = 'dashboard'
+            st.rerun()
+    
+    with col2:
+        if st.button("🔄 Refresh Data", use_container_width=True):
+            load_sheet_data.clear()
+            st.rerun()
     
     student = st.session_state.selected_student
     
