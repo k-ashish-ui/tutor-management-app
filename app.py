@@ -60,6 +60,8 @@ if 'tutor_name' not in st.session_state:
     st.session_state.tutor_name = None
 if 'current_view' not in st.session_state:
     st.session_state.current_view = 'dashboard'
+if 'show_memo_dialog' not in st.session_state:
+    st.session_state.show_memo_dialog = None
 if 'selected_student' not in st.session_state:
     st.session_state.selected_student = None
 
@@ -226,6 +228,39 @@ def get_student_plan(student_id):
     
     return student_plan
 
+def save_tutor_memo(student_id, class_date, memo_text):
+    """Save tutor memo to the Schedule sheet"""
+    try:
+        client = get_google_sheets_client()
+        spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
+        worksheet = spreadsheet.worksheet("Schedule")
+        
+        # Get all data
+        data = worksheet.get_all_records()
+        
+        # Find the row matching student_id and date
+        for idx, row in enumerate(data):
+            if (str(row.get('Student_ID')).strip() == str(student_id).strip() and 
+                str(row.get('Date')).strip() == str(class_date).strip()):
+                
+                row_num = idx + 2  # +2 because header is row 1 and index starts at 0
+                
+                # Find Tutor_Memo column
+                headers = worksheet.row_values(1)
+                if 'Tutor_Memo' in headers:
+                    memo_col = headers.index('Tutor_Memo') + 1
+                    worksheet.update_cell(row_num, memo_col, memo_text)
+                    
+                    # Clear cache
+                    st.cache_data.clear()
+                    return True, "Memo saved successfully!"
+                else:
+                    return False, "Tutor_Memo column not found in Schedule sheet"
+        
+        return False, "Class not found in schedule"
+    except Exception as e:
+        return False, f"Error saving memo: {str(e)}"
+
 def mark_topic_complete(plan_id, tutor_id):
     """Mark a topic as completed"""
     try:
@@ -307,6 +342,11 @@ def show_login():
 
 # Dashboard
 def show_dashboard():
+    # Show memo dialog if triggered
+    if st.session_state.show_memo_dialog:
+        show_memo_dialog()
+        return
+    
     # Header
     col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
@@ -331,9 +371,11 @@ def show_dashboard():
         return
     
     # Tabs
-    tab1, tab2 = st.tabs(["📅 Today's Classes", "📚 Past Classes"])
+    tab1, tab2, tab3 = st.tabs(["📅 Today's Classes", "🔜 Upcoming (7 Days)", "📚 Past Classes"])
     
     today = date.today()
+    from datetime import timedelta
+    next_7_days = today + timedelta(days=7)
     
     with tab1:
         today_classes = classes_df[classes_df['Date'].apply(lambda x: parse_date(x) == today)]
@@ -341,20 +383,67 @@ def show_dashboard():
         if today_classes.empty:
             st.info("No classes scheduled for today")
         else:
+            st.markdown(f"### 📆 {today.strftime('%A, %B %d, %Y')}")
             for _, cls in today_classes.iterrows():
-                show_class_card(cls)
+                show_class_card(cls, f"today_{_}")
     
     with tab2:
+        upcoming_classes = classes_df[classes_df['Date'].apply(
+            lambda x: parse_date(x) and today < parse_date(x) <= next_7_days
+        )]
+        upcoming_classes = upcoming_classes.sort_values('Date', ascending=True)
+        
+        if upcoming_classes.empty:
+            st.info("No upcoming classes in the next 7 days")
+        else:
+            # Group by date
+            for date_val in upcoming_classes['Date'].unique():
+                date_obj = parse_date(date_val)
+                if date_obj:
+                    # Calculate days from today
+                    days_diff = (date_obj - today).days
+                    if days_diff == 1:
+                        day_label = "Tomorrow"
+                    else:
+                        day_label = f"In {days_diff} days"
+                    
+                    st.markdown(f"### 📆 {date_obj.strftime('%A, %B %d, %Y')} ({day_label})")
+                    
+                    day_classes = upcoming_classes[upcoming_classes['Date'] == date_val]
+                    for idx, cls in day_classes.iterrows():
+                        show_class_card(cls, f"upcoming_{date_val}_{idx}")
+                    
+                    st.markdown("---")
+    
+    with tab3:
         past_classes = classes_df[classes_df['Date'].apply(lambda x: parse_date(x) and parse_date(x) < today)]
         past_classes = past_classes.sort_values('Date', ascending=False)
         
         if past_classes.empty:
             st.info("No past classes found")
         else:
-            for _, cls in past_classes.iterrows():
-                show_class_card(cls)
+            # Group by date (show recent 30 days)
+            recent_past = past_classes.head(50)  # Limit to 50 most recent
+            
+            for date_val in recent_past['Date'].unique():
+                date_obj = parse_date(date_val)
+                if date_obj:
+                    # Calculate days ago
+                    days_ago = (today - date_obj).days
+                    if days_ago == 1:
+                        day_label = "Yesterday"
+                    else:
+                        day_label = f"{days_ago} days ago"
+                    
+                    st.markdown(f"### 📆 {date_obj.strftime('%A, %B %d, %Y')} ({day_label})")
+                    
+                    day_classes = recent_past[recent_past['Date'] == date_val]
+                    for idx, cls in day_classes.iterrows():
+                        show_class_card(cls, f"past_{date_val}_{idx}")
+                    
+                    st.markdown("---")
 
-def show_class_card(cls):
+def show_class_card(cls, unique_key):
     """Display a class card"""
     with st.container():
         st.markdown('<div class="class-card">', unsafe_allow_html=True)
@@ -363,12 +452,27 @@ def show_class_card(cls):
         
         with col1:
             st.markdown(f"### {cls.get('Student_Name', cls['Student_ID'])}")
-            st.markdown(f"📅 **Date:** {cls['Date']} | 🕐 **Time:** {cls.get('Start_Time', 'N/A')}")
+            st.markdown(f"📅 **Date:** {cls['Date']} | 🕐 **Time:** {cls.get('Start_Time', 'N/A')} - {cls.get('End_Time', 'N/A')}")
             st.markdown(f"📖 **Subject:** {cls['Subject']}")
             st.markdown(f"🆔 **Student ID:** {cls['Student_ID']}")
+            
+            # Show existing memo if present
+            if pd.notna(cls.get('Tutor_Memo')) and str(cls.get('Tutor_Memo')).strip():
+                st.markdown(f"📝 **Memo:** {cls.get('Tutor_Memo')}")
         
         with col2:
-            if st.button("View Progress →", key=f"view_{cls['Student_ID']}_{cls['Date']}", use_container_width=True):
+            # Add Memo button
+            if st.button("📝 Memo", key=f"memo_{unique_key}", use_container_width=True):
+                st.session_state.show_memo_dialog = {
+                    'student_id': cls['Student_ID'],
+                    'student_name': cls.get('Student_Name', cls['Student_ID']),
+                    'date': cls['Date'],
+                    'existing_memo': cls.get('Tutor_Memo', '')
+                }
+                st.rerun()
+            
+            # View Progress button
+            if st.button("View Progress →", key=f"progress_{unique_key}", use_container_width=True):
                 st.session_state.current_view = 'student'
                 st.session_state.selected_student = {
                     'id': cls['Student_ID'],
@@ -378,6 +482,50 @@ def show_class_card(cls):
                 st.rerun()
         
         st.markdown('</div>', unsafe_allow_html=True)
+
+def show_memo_dialog():
+    """Show dialog for adding/editing memo"""
+    memo_data = st.session_state.show_memo_dialog
+    
+    st.markdown('<div class="main-header"><h1>📝 Add/Edit Memo</h1></div>', unsafe_allow_html=True)
+    
+    st.markdown(f"### {memo_data['student_name']}")
+    st.markdown(f"📅 **Date:** {memo_data['date']}")
+    st.markdown("---")
+    
+    # Memo text area
+    memo_text = st.text_area(
+        "Class Memo",
+        value=memo_data.get('existing_memo', ''),
+        height=200,
+        placeholder="Enter notes about the class: topics covered, student performance, homework assigned, etc.",
+        help="This memo will be saved to the Schedule sheet"
+    )
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("💾 Save Memo", use_container_width=True):
+            if memo_text.strip():
+                success, message = save_tutor_memo(
+                    memo_data['student_id'],
+                    memo_data['date'],
+                    memo_text.strip()
+                )
+                
+                if success:
+                    st.success(message)
+                    st.session_state.show_memo_dialog = None
+                    st.rerun()
+                else:
+                    st.error(message)
+            else:
+                st.warning("Please enter a memo before saving")
+    
+    with col2:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state.show_memo_dialog = None
+            st.rerun()
 
 # Student Plan View
 def show_student_plan():
