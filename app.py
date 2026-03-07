@@ -166,18 +166,50 @@ def log_login_activity(tutor_id, tutor_name):
             worksheet = spreadsheet.worksheet("Usage_Log")
         except gspread.exceptions.WorksheetNotFound:
             # Create the sheet if it doesn't exist
-            worksheet = spreadsheet.add_worksheet(title="Usage_Log", rows="1000", cols="5")
+            worksheet = spreadsheet.add_worksheet(title="Usage_Log", rows="1000", cols="6")
             # Add headers
-            worksheet.append_row(['Timestamp', 'Tutor_ID', 'Tutor_Name', 'Action', 'Date'])
+            worksheet.append_row(['Timestamp', 'Tutor_ID', 'Tutor_Name', 'Action', 'Date', 'Details'])
         
         # Add login entry
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         date_only = datetime.now().strftime('%Y-%m-%d')
-        worksheet.append_row([timestamp, tutor_id, tutor_name, 'Login', date_only])
+        worksheet.append_row([timestamp, tutor_id, tutor_name, 'Login', date_only, ''])
         
     except Exception as e:
         # Don't fail login if logging fails
         print(f"Error logging activity: {str(e)}")
+        pass
+
+def log_topic_completion(tutor_id, plan_id, student_id):
+    """Log when a tutor marks a topic as complete"""
+    try:
+        client = get_google_sheets_client()
+        spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
+        
+        # Get Usage_Log sheet
+        try:
+            worksheet = spreadsheet.worksheet("Usage_Log")
+        except gspread.exceptions.WorksheetNotFound:
+            # Create if doesn't exist
+            worksheet = spreadsheet.add_worksheet(title="Usage_Log", rows="1000", cols="6")
+            worksheet.append_row(['Timestamp', 'Tutor_ID', 'Tutor_Name', 'Action', 'Date', 'Details'])
+        
+        # Get tutor name
+        tutors_df = load_sheet_data("Tutors")
+        tutor_name = tutor_id
+        if tutors_df is not None and not tutors_df.empty:
+            tutor = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == str(tutor_id).strip()]
+            if not tutor.empty:
+                tutor_name = tutor.iloc[0].get('Name', tutor_id)
+        
+        # Add completion entry
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        date_only = datetime.now().strftime('%Y-%m-%d')
+        details = f"Student: {student_id}, Plan: {plan_id}"
+        worksheet.append_row([timestamp, tutor_id, str(tutor_name), 'Topic_Completed', date_only, details])
+        
+    except Exception as e:
+        print(f"Error logging completion: {str(e)}")
         pass
 
 def authenticate_admin(password):
@@ -309,9 +341,11 @@ def mark_topic_complete(plan_id, tutor_id):
         data = worksheet.get_all_records()
         
         # Find the row
+        student_id = None
         for idx, row in enumerate(data):
             if str(row.get('Plan_ID')) == str(plan_id):
                 row_num = idx + 2  # +2 because header is row 1 and index starts at 0
+                student_id = row.get('Student_ID')
                 
                 # Find column indices
                 headers = worksheet.row_values(1)
@@ -323,6 +357,9 @@ def mark_topic_complete(plan_id, tutor_id):
                 worksheet.update_cell(row_num, status_col, 'Completed')
                 worksheet.update_cell(row_num, completed_by_col, tutor_id)
                 worksheet.update_cell(row_num, date_col, datetime.now().strftime('%d/%m/%Y'))
+                
+                # Log the completion activity
+                log_topic_completion(tutor_id, plan_id, student_id)
                 
                 # Clear cache to force refresh
                 st.cache_data.clear()
@@ -627,7 +664,7 @@ def show_admin_panel():
     schedule_df = load_sheet_data("Schedule")
     
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Overview", "👥 Tutor Activity", "📊 Detailed Logs", "⚙️ System Info"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Overview", "👥 Tutor Activity", "⚠️ Completion Alerts", "📊 Detailed Logs", "⚙️ System Info"])
     
     with tab1:
         st.markdown("### 📊 Quick Statistics")
@@ -647,76 +684,187 @@ def show_admin_panel():
         
         with col3:
             if usage_df is not None and not usage_df.empty:
-                # Last 7 days
-                from datetime import timedelta
-                seven_days_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-                active_week = len(usage_df[usage_df['Date'] >= seven_days_ago]['Tutor_ID'].unique())
+                # Topics completed today
+                topics_today = len(usage_df[
+                    (usage_df['Date'] == datetime.now().strftime('%Y-%m-%d')) & 
+                    (usage_df['Action'] == 'Topic_Completed')
+                ])
             else:
-                active_week = 0
-            st.metric("📅 Active This Week", active_week)
+                topics_today = 0
+            st.metric("✅ Topics Done Today", topics_today)
         
         with col4:
             if usage_df is not None and not usage_df.empty:
-                total_logins = len(usage_df)
+                total_completions = len(usage_df[usage_df['Action'] == 'Topic_Completed'])
             else:
-                total_logins = 0
-            st.metric("🔢 Total Logins", total_logins)
+                total_completions = 0
+            st.metric("🔢 Total Completions", total_completions)
         
         st.markdown("---")
         
-        # Recent activity chart
+        # Activity comparison chart
         if usage_df is not None and not usage_df.empty:
-            st.markdown("### 📈 Login Activity (Last 30 Days)")
+            st.markdown("### 📈 Login vs Topic Completion (Last 30 Days)")
             
-            # Group by date
+            # Group by date and action
             usage_df['Date'] = pd.to_datetime(usage_df['Date'])
-            daily_logins = usage_df.groupby(usage_df['Date'].dt.date).size().reset_index()
-            daily_logins.columns = ['Date', 'Logins']
             
-            st.bar_chart(daily_logins.set_index('Date'))
+            daily_activity = usage_df.groupby([usage_df['Date'].dt.date, 'Action']).size().unstack(fill_value=0)
+            
+            # Create chart data
+            chart_data = pd.DataFrame()
+            if 'Login' in daily_activity.columns:
+                chart_data['Logins'] = daily_activity['Login']
+            if 'Topic_Completed' in daily_activity.columns:
+                chart_data['Topics Completed'] = daily_activity['Topic_Completed']
+            
+            if not chart_data.empty:
+                st.line_chart(chart_data)
         else:
-            st.info("No usage data available yet. The Usage_Log sheet will be created when tutors start logging in.")
+            st.info("No usage data available yet.")
     
     with tab2:
         st.markdown("### 👥 Individual Tutor Activity")
         
         if usage_df is not None and not usage_df.empty and tutors_df is not None and not tutors_df.empty:
-            # Tutor login summary
-            tutor_activity = usage_df.groupby('Tutor_ID').agg({
-                'Timestamp': ['count', 'max'],
-                'Tutor_Name': 'first'
-            }).reset_index()
+            # Tutor activity summary
+            tutor_stats = []
             
-            tutor_activity.columns = ['Tutor_ID', 'Total Logins', 'Last Login', 'Name']
-            tutor_activity = tutor_activity.sort_values('Total Logins', ascending=False)
+            for tutor_id in tutors_df['Tutor_ID'].unique():
+                tutor_id_str = str(tutor_id).strip()
+                tutor_data = usage_df[usage_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str]
+                
+                # Get tutor name
+                tutor_info = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str]
+                tutor_name = tutor_info.iloc[0].get('Name', tutor_id) if not tutor_info.empty else tutor_id
+                
+                # Count logins and completions
+                total_logins = len(tutor_data[tutor_data['Action'] == 'Login'])
+                total_completions = len(tutor_data[tutor_data['Action'] == 'Topic_Completed'])
+                
+                # Last login
+                login_data = tutor_data[tutor_data['Action'] == 'Login']
+                last_login = login_data['Timestamp'].max() if not login_data.empty else 'Never'
+                
+                # Today's activity
+                today_str = datetime.now().strftime('%Y-%m-%d')
+                today_data = tutor_data[tutor_data['Date'] == today_str]
+                logins_today = len(today_data[today_data['Action'] == 'Login'])
+                completions_today = len(today_data[today_data['Action'] == 'Topic_Completed'])
+                
+                # Classes assigned today
+                classes_today = 0
+                if schedule_df is not None and not schedule_df.empty:
+                    today_date = datetime.now().strftime('%d/%m/%Y')
+                    tutor_classes_today = schedule_df[
+                        (schedule_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str) &
+                        (schedule_df['Date'].astype(str).str.strip() == today_date)
+                    ]
+                    classes_today = len(tutor_classes_today)
+                
+                tutor_stats.append({
+                    'Tutor_ID': tutor_id,
+                    'Name': tutor_name,
+                    'Total Logins': total_logins,
+                    'Total Completions': total_completions,
+                    'Last Login': last_login,
+                    'Classes Today': classes_today,
+                    'Logins Today': logins_today,
+                    'Completed Today': completions_today
+                })
+            
+            stats_df = pd.DataFrame(tutor_stats)
+            stats_df = stats_df.sort_values('Total Completions', ascending=False)
             
             st.dataframe(
-                tutor_activity,
+                stats_df,
                 use_container_width=True,
                 hide_index=True
             )
-            
-            # Classes assigned
-            if schedule_df is not None and not schedule_df.empty:
-                st.markdown("### 📚 Classes Assigned")
-                classes_per_tutor = schedule_df.groupby('Tutor_ID').size().reset_index()
-                classes_per_tutor.columns = ['Tutor_ID', 'Classes Assigned']
-                
-                # Merge with tutor names
-                if 'Tutor_ID' in tutors_df.columns and 'Name' in tutors_df.columns:
-                    tutor_names = tutors_df[['Tutor_ID', 'Name']].copy()
-                    classes_per_tutor = classes_per_tutor.merge(tutor_names, on='Tutor_ID', how='left')
-                    classes_per_tutor = classes_per_tutor[['Tutor_ID', 'Name', 'Classes Assigned']]
-                
-                st.dataframe(
-                    classes_per_tutor.sort_values('Classes Assigned', ascending=False),
-                    use_container_width=True,
-                    hide_index=True
-                )
         else:
             st.info("No activity data available yet.")
     
     with tab3:
+        st.markdown("### ⚠️ Completion Alerts - Tutors with Pending Topics")
+        st.info("Shows tutors who had classes today but haven't marked all topics complete yet")
+        
+        if schedule_df is not None and not schedule_df.empty and usage_df is not None:
+            today_date = datetime.now().strftime('%d/%m/%Y')
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            
+            # Get today's classes
+            today_classes = schedule_df[schedule_df['Date'].astype(str).str.strip() == today_date]
+            
+            if not today_classes.empty:
+                alerts = []
+                
+                for tutor_id in today_classes['Tutor_ID'].unique():
+                    tutor_id_str = str(tutor_id).strip()
+                    
+                    # Get tutor name
+                    tutor_info = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str]
+                    tutor_name = tutor_info.iloc[0].get('Name', tutor_id) if not tutor_info.empty and not tutors_df.empty else tutor_id
+                    
+                    # Count classes today
+                    tutor_classes = today_classes[today_classes['Tutor_ID'].astype(str).str.strip() == tutor_id_str]
+                    num_classes = len(tutor_classes)
+                    
+                    # Count completions today
+                    completions = usage_df[
+                        (usage_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str) &
+                        (usage_df['Date'] == today_str) &
+                        (usage_df['Action'] == 'Topic_Completed')
+                    ]
+                    num_completions = len(completions)
+                    
+                    # Calculate pending
+                    pending = num_classes - num_completions
+                    
+                    # Alert status
+                    if pending > 0:
+                        status = "⚠️ Behind"
+                        alert_color = "🔴"
+                    elif pending == 0 and num_classes > 0:
+                        status = "✅ On Track"
+                        alert_color = "🟢"
+                    else:
+                        status = "➖ No Classes"
+                        alert_color = "⚪"
+                    
+                    alerts.append({
+                        'Status': alert_color,
+                        'Tutor_ID': tutor_id,
+                        'Tutor_Name': tutor_name,
+                        'Classes Today': num_classes,
+                        'Topics Completed': num_completions,
+                        'Pending': pending if pending > 0 else 0,
+                        'Alert': status
+                    })
+                
+                alerts_df = pd.DataFrame(alerts)
+                # Sort by pending (highest first)
+                alerts_df = alerts_df.sort_values('Pending', ascending=False)
+                
+                # Show alerts
+                st.dataframe(
+                    alerts_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                # Summary
+                behind_count = len(alerts_df[alerts_df['Pending'] > 0])
+                if behind_count > 0:
+                    st.error(f"⚠️ {behind_count} tutor(s) have pending topic completions!")
+                else:
+                    st.success("✅ All tutors are up to date!")
+                    
+            else:
+                st.info("No classes scheduled for today")
+        else:
+            st.info("No schedule data available")
+    
+    with tab4:
         st.markdown("### 📋 Detailed Login Logs")
         
         if usage_df is not None and not usage_df.empty:
