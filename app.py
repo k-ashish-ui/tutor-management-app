@@ -184,6 +184,10 @@ def log_topic_completion(tutor_id, plan_id, student_id):
     """Log when a tutor marks a topic as complete"""
     try:
         client = get_google_sheets_client()
+        if not client:
+            print("No Google Sheets client available")
+            return
+            
         spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
         
         # Get Usage_Log sheet
@@ -194,23 +198,32 @@ def log_topic_completion(tutor_id, plan_id, student_id):
             worksheet = spreadsheet.add_worksheet(title="Usage_Log", rows="1000", cols="6")
             worksheet.append_row(['Timestamp', 'Tutor_ID', 'Tutor_Name', 'Action', 'Date', 'Details'])
         
-        # Get tutor name
-        tutors_df = load_sheet_data("Tutors")
-        tutor_name = tutor_id
-        if tutors_df is not None and not tutors_df.empty:
-            tutor = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == str(tutor_id).strip()]
-            if not tutor.empty:
-                tutor_name = tutor.iloc[0].get('Name', tutor_id)
+        # Get tutor name from cached data or use ID
+        tutor_name = str(tutor_id)
+        try:
+            tutors_df = load_sheet_data("Tutors")
+            if tutors_df is not None and not tutors_df.empty:
+                tutor = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == str(tutor_id).strip()]
+                if not tutor.empty and 'Name' in tutor.columns:
+                    tutor_name = str(tutor.iloc[0]['Name'])
+        except Exception as e:
+            print(f"Error getting tutor name: {e}")
         
         # Add completion entry
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         date_only = datetime.now().strftime('%Y-%m-%d')
         details = f"Student: {student_id}, Plan: {plan_id}"
-        worksheet.append_row([timestamp, tutor_id, str(tutor_name), 'Topic_Completed', date_only, details])
+        
+        # Append the row
+        worksheet.append_row([timestamp, str(tutor_id), tutor_name, 'Topic_Completed', date_only, details])
+        
+        print(f"Successfully logged completion: {tutor_id}, {plan_id}")
         
     except Exception as e:
+        # Print error but don't fail the completion
         print(f"Error logging completion: {str(e)}")
-        pass
+        import traceback
+        traceback.print_exc()
 
 def authenticate_admin(password):
     """Authenticate admin access"""
@@ -334,39 +347,64 @@ def mark_topic_complete(plan_id, tutor_id):
     """Mark a topic as completed"""
     try:
         client = get_google_sheets_client()
+        if not client:
+            return False, "Cannot connect to Google Sheets"
+            
         spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
         worksheet = spreadsheet.worksheet("Student_Plan")
         
         # Get all data
-        data = worksheet.get_all_records()
+        all_data = worksheet.get_all_values()
         
-        # Find the row
+        if len(all_data) < 2:
+            return False, "Student_Plan sheet is empty"
+        
+        headers = all_data[0]
+        data_rows = all_data[1:]
+        
+        # Find column indices
+        try:
+            plan_id_col = headers.index('Plan_ID')
+            student_id_col = headers.index('Student_ID')
+            status_col = headers.index('Status')
+            completed_by_col = headers.index('Completed_By')
+            date_col = headers.index('Date_Completed')
+        except ValueError as e:
+            return False, f"Required column not found: {str(e)}"
+        
+        # Find the row with matching Plan_ID
         student_id = None
-        for idx, row in enumerate(data):
-            if str(row.get('Plan_ID')) == str(plan_id):
-                row_num = idx + 2  # +2 because header is row 1 and index starts at 0
-                student_id = row.get('Student_ID')
-                
-                # Find column indices
-                headers = worksheet.row_values(1)
-                status_col = headers.index('Status') + 1
-                completed_by_col = headers.index('Completed_By') + 1
-                date_col = headers.index('Date_Completed') + 1
-                
-                # Update the cells
-                worksheet.update_cell(row_num, status_col, 'Completed')
-                worksheet.update_cell(row_num, completed_by_col, tutor_id)
-                worksheet.update_cell(row_num, date_col, datetime.now().strftime('%d/%m/%Y'))
-                
-                # Log the completion activity
-                log_topic_completion(tutor_id, plan_id, student_id)
-                
-                # Clear cache to force refresh
-                st.cache_data.clear()
-                
-                return True, "Topic marked as completed!"
+        found_row = None
         
-        return False, "Plan ID not found"
+        for idx, row in enumerate(data_rows):
+            if len(row) > plan_id_col and str(row[plan_id_col]).strip() == str(plan_id).strip():
+                found_row = idx + 2  # +2 because: header is row 1, and we're in 0-indexed data_rows
+                if len(row) > student_id_col:
+                    student_id = row[student_id_col]
+                break
+        
+        if found_row is None:
+            return False, f"Plan ID '{plan_id}' not found in Student_Plan sheet"
+        
+        # Update the cells
+        current_date = datetime.now().strftime('%d/%m/%Y')
+        
+        worksheet.update_cell(found_row, status_col + 1, 'Completed')
+        worksheet.update_cell(found_row, completed_by_col + 1, str(tutor_id))
+        worksheet.update_cell(found_row, date_col + 1, current_date)
+        
+        # Log the completion activity
+        if student_id:
+            log_topic_completion(tutor_id, plan_id, student_id)
+        
+        # Clear ALL caches to force refresh
+        st.cache_data.clear()
+        load_sheet_data.clear()
+        
+        return True, "Topic marked as completed!"
+        
+    except gspread.exceptions.WorksheetNotFound:
+        return False, "Student_Plan sheet not found"
     except Exception as e:
         return False, f"Error updating: {str(e)}"
 
@@ -936,16 +974,24 @@ def show_admin_panel():
 
 # Student Plan View
 def show_student_plan():
-    col1, col2 = st.columns([3, 1])
+    col1, col2, col3 = st.columns([2, 1, 1])
     
     with col1:
         if st.button("← Back to Dashboard"):
             st.session_state.current_view = 'dashboard'
+            load_sheet_data.clear()
             st.rerun()
     
     with col2:
-        if st.button("🔄 Refresh Data", use_container_width=True):
+        if st.button("🔄 Refresh", use_container_width=True):
             load_sheet_data.clear()
+            st.cache_data.clear()
+            st.rerun()
+    
+    with col3:
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.tutor_id = None
             st.rerun()
     
     student = st.session_state.selected_student
@@ -997,12 +1043,14 @@ def show_student_plan():
                 st.caption(f"{topic.get('Date_Completed', 'N/A')}")
             else:
                 if st.button("Mark Done", key=f"complete_{topic['Plan_ID']}", use_container_width=True):
-                    success, message = mark_topic_complete(topic['Plan_ID'], st.session_state.tutor_id)
-                    if success:
-                        st.success(message)
-                        st.rerun()
-                    else:
-                        st.error(message)
+                    with st.spinner('Updating...'):
+                        success, message = mark_topic_complete(topic['Plan_ID'], st.session_state.tutor_id)
+                        if success:
+                            st.success(message)
+                            # Force immediate refresh by rerunning
+                            st.rerun()
+                        else:
+                            st.error(message)
         
         st.markdown('</div>', unsafe_allow_html=True)
 
