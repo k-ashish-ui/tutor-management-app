@@ -793,12 +793,18 @@ def show_admin_panel():
                 # Classes assigned today
                 classes_today = 0
                 if schedule_df is not None and not schedule_df.empty:
-                    today_date = datetime.now().strftime('%d/%m/%Y')
-                    tutor_classes_today = schedule_df[
-                        (schedule_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str) &
-                        (schedule_df['Date'].astype(str).str.strip() == today_date)
+                    # Try multiple date formats
+                    today_date = datetime.now().date()
+                    
+                    tutor_schedule = schedule_df[
+                        schedule_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str
                     ]
-                    classes_today = len(tutor_classes_today)
+                    
+                    # Count classes that match today's date
+                    for _, row in tutor_schedule.iterrows():
+                        class_date = parse_date(str(row['Date']))
+                        if class_date and class_date == today_date:
+                            classes_today += 1
                 
                 tutor_stats.append({
                     'Tutor_ID': tutor_id,
@@ -827,24 +833,30 @@ def show_admin_panel():
         st.info("Shows tutors who had classes today but haven't marked all topics complete yet")
         
         if schedule_df is not None and not schedule_df.empty and usage_df is not None:
-            today_date = datetime.now().strftime('%d/%m/%Y')
+            today_date = datetime.now().date()
             today_str = datetime.now().strftime('%Y-%m-%d')
             
-            # Get today's classes
-            today_classes = schedule_df[schedule_df['Date'].astype(str).str.strip() == today_date]
+            # Get today's classes using the parse_date function
+            today_classes = []
+            for _, row in schedule_df.iterrows():
+                class_date = parse_date(str(row['Date']))
+                if class_date and class_date == today_date:
+                    today_classes.append(row)
             
-            if not today_classes.empty:
+            today_classes_df = pd.DataFrame(today_classes) if today_classes else pd.DataFrame()
+            
+            if not today_classes_df.empty:
                 alerts = []
                 
-                for tutor_id in today_classes['Tutor_ID'].unique():
+                for tutor_id in today_classes_df['Tutor_ID'].unique():
                     tutor_id_str = str(tutor_id).strip()
                     
                     # Get tutor name
-                    tutor_info = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str]
-                    tutor_name = tutor_info.iloc[0].get('Name', tutor_id) if not tutor_info.empty and not tutors_df.empty else tutor_id
+                    tutor_info = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str] if tutors_df is not None and not tutors_df.empty else pd.DataFrame()
+                    tutor_name = tutor_info.iloc[0].get('Name', tutor_id) if not tutor_info.empty and 'Name' in tutor_info.columns else tutor_id
                     
                     # Count classes today
-                    tutor_classes = today_classes[today_classes['Tutor_ID'].astype(str).str.strip() == tutor_id_str]
+                    tutor_classes = today_classes_df[today_classes_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str]
                     num_classes = len(tutor_classes)
                     
                     # Count completions today
