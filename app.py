@@ -64,6 +64,8 @@ if 'show_memo_dialog' not in st.session_state:
     st.session_state.show_memo_dialog = None
 if 'selected_student' not in st.session_state:
     st.session_state.selected_student = None
+if 'admin_mode' not in st.session_state:
+    st.session_state.admin_mode = False
 
 # Google Sheets connection
 @st.cache_resource
@@ -145,9 +147,44 @@ def authenticate_tutor(tutor_id, password):
     stored_password = str(tutor.iloc[0]['Password']).strip()
     if stored_password == str(password).strip():
         tutor_name = tutor.iloc[0].get('Name', tutor_id) if 'Name' in tutor.columns else tutor_id
+        
+        # Log the login activity
+        log_login_activity(tutor_id, str(tutor_name))
+        
         return True, str(tutor_name)
     else:
         return False, "Invalid password"
+
+def log_login_activity(tutor_id, tutor_name):
+    """Log tutor login activity to Usage_Log sheet"""
+    try:
+        client = get_google_sheets_client()
+        spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
+        
+        # Try to get or create Usage_Log sheet
+        try:
+            worksheet = spreadsheet.worksheet("Usage_Log")
+        except gspread.exceptions.WorksheetNotFound:
+            # Create the sheet if it doesn't exist
+            worksheet = spreadsheet.add_worksheet(title="Usage_Log", rows="1000", cols="5")
+            # Add headers
+            worksheet.append_row(['Timestamp', 'Tutor_ID', 'Tutor_Name', 'Action', 'Date'])
+        
+        # Add login entry
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        date_only = datetime.now().strftime('%Y-%m-%d')
+        worksheet.append_row([timestamp, tutor_id, tutor_name, 'Login', date_only])
+        
+    except Exception as e:
+        # Don't fail login if logging fails
+        print(f"Error logging activity: {str(e)}")
+        pass
+
+def authenticate_admin(password):
+    """Authenticate admin access"""
+    # Get admin password from secrets
+    admin_password = st.secrets.get("admin_password", "admin123")
+    return password == admin_password
 
 def get_tutor_classes(tutor_id):
     """Get all classes for a specific tutor"""
@@ -299,6 +336,13 @@ def mark_topic_complete(plan_id, tutor_id):
 # Login Page
 def show_login():
     st.markdown('<div class="main-header"><h1>📚 Tutor Management System</h1><p>Please login to continue</p></div>', unsafe_allow_html=True)
+    
+    # Admin access link
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col3:
+        if st.button("🔐 Admin Access", use_container_width=True):
+            st.session_state.admin_mode = True
+            st.rerun()
     
     col1, col2, col3 = st.columns([1, 2, 1])
     
@@ -527,6 +571,221 @@ def show_memo_dialog():
             st.session_state.show_memo_dialog = None
             st.rerun()
 
+            st.session_state.show_memo_dialog = None
+            st.rerun()
+
+# Admin Panel
+def show_admin_login():
+    """Admin login page"""
+    st.markdown('<div class="main-header"><h1>🔐 Admin Panel</h1><p>Administrator Access</p></div>', unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        if st.button("← Back to Tutor Login"):
+            st.session_state.admin_mode = False
+            st.rerun()
+        
+        st.markdown("### 🔑 Admin Authentication")
+        
+        with st.form("admin_login_form"):
+            admin_password = st.text_input("Admin Password", type="password", placeholder="Enter admin password")
+            submit = st.form_submit_button("Login as Admin", use_container_width=True)
+            
+            if submit:
+                if not admin_password:
+                    st.error("Please enter admin password")
+                else:
+                    if authenticate_admin(admin_password):
+                        st.session_state.logged_in = True
+                        st.session_state.tutor_id = 'ADMIN'
+                        st.session_state.tutor_name = 'Administrator'
+                        st.rerun()
+                    else:
+                        st.error("Invalid admin password")
+        
+        st.info("💡 Default admin password is set in Streamlit secrets. Contact system administrator if you don't have it.")
+
+def show_admin_panel():
+    """Admin dashboard with usage analytics"""
+    
+    # Header
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.markdown('<div class="main-header"><h1>📊 Admin Dashboard</h1><p>System Analytics & Usage Statistics</p></div>', unsafe_allow_html=True)
+    with col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.tutor_id = None
+            st.session_state.admin_mode = False
+            st.rerun()
+    
+    # Load usage data
+    usage_df = load_sheet_data("Usage_Log")
+    tutors_df = load_sheet_data("Tutors")
+    schedule_df = load_sheet_data("Schedule")
+    
+    # Tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 Overview", "👥 Tutor Activity", "📊 Detailed Logs", "⚙️ System Info"])
+    
+    with tab1:
+        st.markdown("### 📊 Quick Statistics")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            total_tutors = len(tutors_df) if tutors_df is not None and not tutors_df.empty else 0
+            st.metric("👥 Total Tutors", total_tutors)
+        
+        with col2:
+            if usage_df is not None and not usage_df.empty:
+                unique_users_today = len(usage_df[usage_df['Date'] == datetime.now().strftime('%Y-%m-%d')]['Tutor_ID'].unique())
+            else:
+                unique_users_today = 0
+            st.metric("🟢 Active Today", unique_users_today)
+        
+        with col3:
+            if usage_df is not None and not usage_df.empty:
+                # Last 7 days
+                from datetime import timedelta
+                seven_days_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+                active_week = len(usage_df[usage_df['Date'] >= seven_days_ago]['Tutor_ID'].unique())
+            else:
+                active_week = 0
+            st.metric("📅 Active This Week", active_week)
+        
+        with col4:
+            if usage_df is not None and not usage_df.empty:
+                total_logins = len(usage_df)
+            else:
+                total_logins = 0
+            st.metric("🔢 Total Logins", total_logins)
+        
+        st.markdown("---")
+        
+        # Recent activity chart
+        if usage_df is not None and not usage_df.empty:
+            st.markdown("### 📈 Login Activity (Last 30 Days)")
+            
+            # Group by date
+            usage_df['Date'] = pd.to_datetime(usage_df['Date'])
+            daily_logins = usage_df.groupby(usage_df['Date'].dt.date).size().reset_index()
+            daily_logins.columns = ['Date', 'Logins']
+            
+            st.bar_chart(daily_logins.set_index('Date'))
+        else:
+            st.info("No usage data available yet. The Usage_Log sheet will be created when tutors start logging in.")
+    
+    with tab2:
+        st.markdown("### 👥 Individual Tutor Activity")
+        
+        if usage_df is not None and not usage_df.empty and tutors_df is not None and not tutors_df.empty:
+            # Tutor login summary
+            tutor_activity = usage_df.groupby('Tutor_ID').agg({
+                'Timestamp': ['count', 'max'],
+                'Tutor_Name': 'first'
+            }).reset_index()
+            
+            tutor_activity.columns = ['Tutor_ID', 'Total Logins', 'Last Login', 'Name']
+            tutor_activity = tutor_activity.sort_values('Total Logins', ascending=False)
+            
+            st.dataframe(
+                tutor_activity,
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Classes assigned
+            if schedule_df is not None and not schedule_df.empty:
+                st.markdown("### 📚 Classes Assigned")
+                classes_per_tutor = schedule_df.groupby('Tutor_ID').size().reset_index()
+                classes_per_tutor.columns = ['Tutor_ID', 'Classes Assigned']
+                
+                # Merge with tutor names
+                if 'Tutor_ID' in tutors_df.columns and 'Name' in tutors_df.columns:
+                    tutor_names = tutors_df[['Tutor_ID', 'Name']].copy()
+                    classes_per_tutor = classes_per_tutor.merge(tutor_names, on='Tutor_ID', how='left')
+                    classes_per_tutor = classes_per_tutor[['Tutor_ID', 'Name', 'Classes Assigned']]
+                
+                st.dataframe(
+                    classes_per_tutor.sort_values('Classes Assigned', ascending=False),
+                    use_container_width=True,
+                    hide_index=True
+                )
+        else:
+            st.info("No activity data available yet.")
+    
+    with tab3:
+        st.markdown("### 📋 Detailed Login Logs")
+        
+        if usage_df is not None and not usage_df.empty:
+            # Filters
+            col1, col2 = st.columns(2)
+            with col1:
+                tutor_filter = st.multiselect(
+                    "Filter by Tutor",
+                    options=usage_df['Tutor_ID'].unique(),
+                    default=None
+                )
+            
+            with col2:
+                days_back = st.slider("Show last N days", 1, 90, 30)
+            
+            # Apply filters
+            filtered_df = usage_df.copy()
+            
+            if tutor_filter:
+                filtered_df = filtered_df[filtered_df['Tutor_ID'].isin(tutor_filter)]
+            
+            # Date filter
+            from datetime import timedelta
+            date_threshold = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            filtered_df = filtered_df[filtered_df['Date'] >= date_threshold]
+            
+            # Sort by most recent
+            filtered_df = filtered_df.sort_values('Timestamp', ascending=False)
+            
+            st.dataframe(
+                filtered_df,
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Download button
+            csv = filtered_df.to_csv(index=False)
+            st.download_button(
+                label="📥 Download as CSV",
+                data=csv,
+                file_name=f"usage_logs_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.info("No logs available yet.")
+    
+    with tab4:
+        st.markdown("### ⚙️ System Configuration")
+        
+        st.markdown("**Google Sheets Configuration:**")
+        st.code(f"Spreadsheet ID: {st.secrets['spreadsheet_id']}")
+        
+        st.markdown("**Available Sheets:**")
+        try:
+            client = get_google_sheets_client()
+            spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
+            all_sheets = [ws.title for ws in spreadsheet.worksheets()]
+            st.write(all_sheets)
+        except Exception as e:
+            st.error(f"Error accessing sheets: {str(e)}")
+        
+        st.markdown("**Total Records:**")
+        if tutors_df is not None:
+            st.write(f"- Tutors: {len(tutors_df)}")
+        if schedule_df is not None:
+            st.write(f"- Schedule entries: {len(schedule_df)}")
+        if usage_df is not None:
+            st.write(f"- Usage logs: {len(usage_df)}")
+
 # Student Plan View
 def show_student_plan():
     col1, col2 = st.columns([3, 1])
@@ -602,12 +861,21 @@ def show_student_plan():
 # Main App
 def main():
     if not st.session_state.logged_in:
-        show_login()
+        # Show admin login if admin mode
+        if st.session_state.admin_mode:
+            show_admin_login()
+        else:
+            show_login()
     else:
-        if st.session_state.current_view == 'dashboard':
-            show_dashboard()
-        elif st.session_state.current_view == 'student':
-            show_student_plan()
+        # Check if logged in as admin
+        if st.session_state.tutor_id == 'ADMIN':
+            show_admin_panel()
+        else:
+            # Regular tutor view
+            if st.session_state.current_view == 'dashboard':
+                show_dashboard()
+            elif st.session_state.current_view == 'student':
+                show_student_plan()
 
 if __name__ == "__main__":
     main()
