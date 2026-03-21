@@ -275,40 +275,104 @@ def parse_date(date_str):
     return None
 
 def get_student_plan(student_id):
-    """Get learning plan for a specific student"""
-    plan_df = load_sheet_data("Student_Plan")
-    curriculum_df = load_sheet_data("Curriculum_Library")
-    
-    if plan_df is None or curriculum_df is None:
-        return pd.DataFrame()
-    
-    # Filter by student - handle string comparison properly
-    student_plan = plan_df[plan_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()].copy()
-    
-    # Join with curriculum to get topic names
-    if not curriculum_df.empty:
-        curriculum_map = dict(zip(
-            curriculum_df['Topic_ID'].astype(str).str.strip(), 
-            curriculum_df['Sub_Unit_Name'].astype(str).str.strip()
-        ))
-        unit_map = dict(zip(
-            curriculum_df['Topic_ID'].astype(str).str.strip(), 
-            curriculum_df['Unit_Name'].astype(str).str.strip()
-        ))
-        link_map = dict(zip(
-            curriculum_df['Topic_ID'].astype(str).str.strip(), 
-            curriculum_df['Textbook_Ref'].astype(str).str.strip()
-        ))
+    """Get learning plan for a specific student - automatically generated from curriculum"""
+    try:
+        # Load required sheets
+        students_df = load_sheet_data("Students ")
+        if students_df is None:
+            students_df = load_sheet_data("Students")
         
-        student_plan['Sub_Unit_Name'] = student_plan['Topic_ID'].astype(str).str.strip().map(curriculum_map)
-        student_plan['Unit_Name'] = student_plan['Topic_ID'].astype(str).str.strip().map(unit_map)
-        student_plan['Content_Link'] = student_plan.apply(
-            lambda row: row.get('Topic_Content', '') if pd.notna(row.get('Topic_Content')) and str(row.get('Topic_Content')).strip() 
-                       else link_map.get(str(row['Topic_ID']).strip(), ''),
-            axis=1
-        )
+        curriculum_df = load_sheet_data("Curriculum_Library")
+        
+        # Try to load Progress_Tracker (might not exist yet)
+        progress_df = load_sheet_data("Progress_Tracker")
+        
+        if students_df is None or curriculum_df is None:
+            return pd.DataFrame()
+        
+        # Get student info
+        student = students_df[students_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()]
+        
+        if student.empty:
+            return pd.DataFrame()
+        
+        student_grade = str(student.iloc[0].get('Grade', '')).strip()
+        student_subject = str(student.iloc[0].get('Subject', '')).strip()
+        
+        # Get all topics for this grade and subject from curriculum
+        student_topics = curriculum_df[
+            (curriculum_df['Grade'].astype(str).str.strip() == student_grade) &
+            (curriculum_df['Subject'].astype(str).str.strip() == student_subject)
+        ].copy()
+        
+        if student_topics.empty:
+            # Fallback: if no Grade/Subject columns, show all curriculum
+            student_topics = curriculum_df.copy()
+        
+        # Create plan list
+        plans = []
+        
+        for _, topic in student_topics.iterrows():
+            topic_id = str(topic['Topic_ID']).strip()
+            
+            # Check if this topic is completed by this student
+            is_completed = False
+            completed_by = ''
+            completed_at = ''
+            
+            if progress_df is not None and not progress_df.empty:
+                completion = progress_df[
+                    (progress_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()) &
+                    (progress_df['Topic_ID'].astype(str).str.strip() == topic_id)
+                ]
+                
+                if not completion.empty:
+                    is_completed = True
+                    completed_by = completion.iloc[0].get('Completed_By', '')
+                    date_val = completion.iloc[0].get('Date_Completed', '')
+                    completed_at = formatDate(date_val) if date_val else ''
+            
+            # Create plan entry
+            plan_id = f"{student_id}-{topic_id}"
+            
+            plans.append({
+                'planId': plan_id,
+                'topicId': topic_id,
+                'subUnitName': str(topic.get('Sub_Unit_Name', 'Unknown Topic')),
+                'unitName': str(topic.get('Unit_Name', '')),
+                'subject': str(topic.get('Subject', student_subject)),
+                'status': 'Completed' if is_completed else 'Pending',
+                'completedBy': str(completed_by),
+                'dateCompleted': str(completed_at),
+                'contentLink': str(topic.get('Textbook_Ref', ''))
+            })
+        
+        return pd.DataFrame(plans)
+        
+    except Exception as e:
+        print(f"Error in get_student_plan: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
+def formatDate(date_val):
+    """Format date value"""
+    if pd.isna(date_val) or not date_val:
+        return ''
     
-    return student_plan
+    date_str = str(date_val).strip()
+    if not date_str:
+        return ''
+    
+    # Try to parse and format
+    try:
+        parsed = parse_date(date_str)
+        if parsed:
+            return parsed.strftime('%d/%m/%Y')
+    except:
+        pass
+    
+    return date_str
 
 def save_tutor_memo(student_id, class_date, memo_text):
     """Save tutor memo to the Schedule sheet"""
@@ -344,68 +408,79 @@ def save_tutor_memo(student_id, class_date, memo_text):
         return False, f"Error saving memo: {str(e)}"
 
 def mark_topic_complete(plan_id, tutor_id):
-    """Mark a topic as completed"""
+    """Mark a topic as completed - saves to Progress_Tracker sheet"""
     try:
+        # Extract student_id and topic_id from plan_id
+        # Format: StudentID-TopicID (e.g., "S01090001-G10C01-1")
+        parts = plan_id.split('-', 1)
+        if len(parts) < 2:
+            return False, "Invalid Plan ID format"
+        
+        student_id = parts[0]
+        topic_id = parts[1]
+        
         client = get_google_sheets_client()
         if not client:
             return False, "Cannot connect to Google Sheets"
             
         spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
-        worksheet = spreadsheet.worksheet("Student_Plan")
         
-        # Get all data
+        # Get or create Progress_Tracker sheet
+        try:
+            worksheet = spreadsheet.worksheet("Progress_Tracker")
+        except gspread.exceptions.WorksheetNotFound:
+            # Create the sheet if it doesn't exist
+            worksheet = spreadsheet.add_worksheet(title="Progress_Tracker", rows="1000", cols="4")
+            worksheet.append_row(['Student_ID', 'Topic_ID', 'Completed_By', 'Date_Completed'])
+        
+        # Check if this completion already exists
         all_data = worksheet.get_all_values()
         
-        if len(all_data) < 2:
-            return False, "Student_Plan sheet is empty"
+        if len(all_data) > 1:  # Has data beyond header
+            headers = all_data[0]
+            data_rows = all_data[1:]
+            
+            student_col = headers.index('Student_ID') if 'Student_ID' in headers else 0
+            topic_col = headers.index('Topic_ID') if 'Topic_ID' in headers else 1
+            
+            # Check if already completed
+            for idx, row in enumerate(data_rows):
+                if (len(row) > max(student_col, topic_col) and
+                    str(row[student_col]).strip() == str(student_id).strip() and
+                    str(row[topic_col]).strip() == str(topic_id).strip()):
+                    # Already completed - update it
+                    row_num = idx + 2
+                    completed_by_col = headers.index('Completed_By') + 1
+                    date_col = headers.index('Date_Completed') + 1
+                    
+                    worksheet.update_cell(row_num, completed_by_col, str(tutor_id))
+                    worksheet.update_cell(row_num, date_col, datetime.now().strftime('%d/%m/%Y'))
+                    
+                    # Log the completion
+                    log_topic_completion(tutor_id, plan_id, student_id)
+                    
+                    # Clear caches
+                    st.cache_data.clear()
+                    load_sheet_data.clear()
+                    
+                    return True, "Topic marked as completed!"
         
-        headers = all_data[0]
-        data_rows = all_data[1:]
-        
-        # Find column indices
-        try:
-            plan_id_col = headers.index('Plan_ID')
-            student_id_col = headers.index('Student_ID')
-            status_col = headers.index('Status')
-            completed_by_col = headers.index('Completed_By')
-            date_col = headers.index('Date_Completed')
-        except ValueError as e:
-            return False, f"Required column not found: {str(e)}"
-        
-        # Find the row with matching Plan_ID
-        student_id = None
-        found_row = None
-        
-        for idx, row in enumerate(data_rows):
-            if len(row) > plan_id_col and str(row[plan_id_col]).strip() == str(plan_id).strip():
-                found_row = idx + 2  # +2 because: header is row 1, and we're in 0-indexed data_rows
-                if len(row) > student_id_col:
-                    student_id = row[student_id_col]
-                break
-        
-        if found_row is None:
-            return False, f"Plan ID '{plan_id}' not found in Student_Plan sheet"
-        
-        # Update the cells
+        # Not found - add new row
         current_date = datetime.now().strftime('%d/%m/%Y')
-        
-        worksheet.update_cell(found_row, status_col + 1, 'Completed')
-        worksheet.update_cell(found_row, completed_by_col + 1, str(tutor_id))
-        worksheet.update_cell(found_row, date_col + 1, current_date)
+        worksheet.append_row([student_id, topic_id, str(tutor_id), current_date])
         
         # Log the completion activity
-        if student_id:
-            log_topic_completion(tutor_id, plan_id, student_id)
+        log_topic_completion(tutor_id, plan_id, student_id)
         
-        # Clear ALL caches to force refresh
+        # Clear caches
         st.cache_data.clear()
         load_sheet_data.clear()
         
         return True, "Topic marked as completed!"
         
-    except gspread.exceptions.WorksheetNotFound:
-        return False, "Student_Plan sheet not found"
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return False, f"Error updating: {str(e)}"
 
 # Login Page
@@ -447,15 +522,43 @@ def show_login():
         
         # Debug section
         with st.expander("🔍 Debug Info (Click if login fails)"):
-            if st.button("Check Tutors Sheet"):
-                tutors_df = load_sheet_data("Tutors")
-                if tutors_df is not None:
-                    st.success(f"✅ Tutors sheet found with {len(tutors_df)} rows")
-                    st.write("**Columns found:**", list(tutors_df.columns))
-                    st.write("**Sample data (first 3 rows):**")
-                    st.dataframe(tutors_df.head(3))
-                else:
-                    st.error("❌ Cannot access Tutors sheet")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("Check Tutors Sheet"):
+                    tutors_df = load_sheet_data("Tutors")
+                    if tutors_df is not None:
+                        st.success(f"✅ Tutors sheet found with {len(tutors_df)} rows")
+                        st.write("**Columns found:**", list(tutors_df.columns))
+                        st.write("**Sample data (first 3 rows):**")
+                        st.dataframe(tutors_df.head(3))
+                    else:
+                        st.error("❌ Cannot access Tutors sheet")
+            
+            with col2:
+                if st.button("Check System Setup"):
+                    st.write("**Checking sheets...**")
+                    
+                    # Check all sheets
+                    students = load_sheet_data("Students ") or load_sheet_data("Students")
+                    curriculum = load_sheet_data("Curriculum_Library")
+                    schedule = load_sheet_data("Schedule")
+                    progress_tracker = load_sheet_data("Progress_Tracker")
+                    student_plan = load_sheet_data("Student_Plan")
+                    
+                    st.write("✅ Students:" if students is not None else "❌ Students:", 
+                             "Found" if students is not None else "Missing")
+                    st.write("✅ Curriculum:" if curriculum is not None else "❌ Curriculum:", 
+                             "Found" if curriculum is not None else "Missing")
+                    st.write("✅ Schedule:" if schedule is not None else "❌ Schedule:", 
+                             "Found" if schedule is not None else "Missing")
+                    
+                    if progress_tracker is not None:
+                        st.success("✅ Progress_Tracker: Found (NEW system)")
+                    elif student_plan is not None:
+                        st.warning("⚠️ Student_Plan: Found (OLD system - consider migrating)")
+                    else:
+                        st.error("❌ No progress tracking system found")
         
         st.info("💡 **First time setup required:**\n\n1. Create a 'Tutors' sheet with columns: Tutor_ID, Password, Name\n2. Add your credentials there\n3. Configure Google Sheets API (see deployment guide)")
 
@@ -700,6 +803,12 @@ def show_admin_panel():
     usage_df = load_sheet_data("Usage_Log")
     tutors_df = load_sheet_data("Tutors")
     schedule_df = load_sheet_data("Schedule")
+    
+    # Try to load progress data (works with both old and new system)
+    progress_df = load_sheet_data("Progress_Tracker")
+    if progress_df is None or progress_df.empty:
+        # Fallback to old Student_Plan if Progress_Tracker doesn't exist
+        progress_df = load_sheet_data("Student_Plan")
     
     # Tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Overview", "👥 Tutor Activity", "⚠️ Completion Alerts", "📊 Detailed Logs", "⚙️ System Info"])
@@ -1014,13 +1123,28 @@ def show_student_plan():
     # Load plan
     plan_df = get_student_plan(student['id'])
     
-    if plan_df.empty:
-        st.warning("No learning plan found for this student")
+    if plan_df is None or (isinstance(plan_df, pd.DataFrame) and plan_df.empty):
+        st.warning("⚠️ No learning plan found for this student")
+        
+        # Show helpful message based on system
+        st.info("""
+        **Possible reasons:**
+        
+        1. **NEW System**: Student needs Grade and Subject filled in Students sheet, and matching topics in Curriculum_Library
+        2. **OLD System**: Student needs topics added to Student_Plan sheet
+        3. Check that column names match exactly (case-sensitive)
+        
+        **Quick Fix:**
+        - Open Students sheet
+        - Make sure this student has Grade and Subject filled in
+        - Open Curriculum_Library sheet  
+        - Verify topics exist for that Grade + Subject
+        """)
         return
     
     # Progress overview
-    completed = len(plan_df[plan_df['Status'] == 'Completed'])
-    pending = len(plan_df[plan_df['Status'] != 'Completed'])
+    completed = len(plan_df[plan_df['status'] == 'Completed'])
+    pending = len(plan_df[plan_df['status'] != 'Completed'])
     
     col1, col2 = st.columns(2)
     with col1:
@@ -1032,8 +1156,8 @@ def show_student_plan():
     st.markdown("### 📝 Learning Topics")
     
     # Display topics
-    for _, topic in plan_df.iterrows():
-        is_completed = topic['Status'] == 'Completed'
+    for idx, topic in plan_df.iterrows():
+        is_completed = topic['status'] == 'Completed'
         card_class = "topic-card completed" if is_completed else "topic-card"
         
         st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
@@ -1041,22 +1165,24 @@ def show_student_plan():
         col1, col2 = st.columns([4, 1])
         
         with col1:
-            st.markdown(f"**{topic.get('Sub_Unit_Name', 'Unknown Topic')}**")
-            if pd.notna(topic.get('Unit_Name')):
-                st.caption(f"Unit: {topic['Unit_Name']}")
+            st.markdown(f"**{topic.get('subUnitName', 'Unknown Topic')}**")
+            if pd.notna(topic.get('unitName')) and topic.get('unitName'):
+                st.caption(f"Unit: {topic['unitName']}")
             
-            if pd.notna(topic.get('Content_Link')) and topic['Content_Link']:
-                st.markdown(f"[📎 View Content]({topic['Content_Link']})")
+            if pd.notna(topic.get('contentLink')) and topic.get('contentLink'):
+                st.markdown(f"[📎 View Content]({topic['contentLink']})")
         
         with col2:
             if is_completed:
                 st.success("✓ Done")
-                st.caption(f"By: {topic.get('Completed_By', 'N/A')}")
-                st.caption(f"{topic.get('Date_Completed', 'N/A')}")
+                if topic.get('completedBy'):
+                    st.caption(f"By: {topic['completedBy']}")
+                if topic.get('dateCompleted'):
+                    st.caption(f"{topic['dateCompleted']}")
             else:
-                if st.button("Mark Done", key=f"complete_{topic['Plan_ID']}", use_container_width=True):
+                if st.button("Mark Done", key=f"complete_{topic['planId']}", use_container_width=True):
                     with st.spinner('Updating...'):
-                        success, message = mark_topic_complete(topic['Plan_ID'], st.session_state.tutor_id)
+                        success, message = mark_topic_complete(topic['planId'], st.session_state.tutor_id)
                         if success:
                             st.success(message)
                             # Force immediate refresh by rerunning
