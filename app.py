@@ -274,8 +274,13 @@ def parse_date(date_str):
     
     return None
 
-def get_student_plan(student_id):
-    """Get learning plan for a specific student - automatically generated from curriculum"""
+def get_student_plan(student_id, subject_filter=None):
+    """Get learning plan for a specific student - automatically generated from curriculum
+    
+    Args:
+        student_id: The student's ID
+        subject_filter: Optional subject to filter by (when student takes multiple subjects)
+    """
     try:
         # Load required sheets
         students_df = load_sheet_data("Students ")
@@ -290,8 +295,16 @@ def get_student_plan(student_id):
         if students_df is None or curriculum_df is None:
             return pd.DataFrame()
         
-        # Get student info
-        student = students_df[students_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()]
+        # Get student info - if subject_filter provided, use it
+        if subject_filter:
+            # Find the specific student+subject combination
+            student = students_df[
+                (students_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()) &
+                (students_df['Subject'].astype(str).str.strip() == str(subject_filter).strip())
+            ]
+        else:
+            # Get first match (backward compatibility)
+            student = students_df[students_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()]
         
         if student.empty:
             return pd.DataFrame()
@@ -315,16 +328,23 @@ def get_student_plan(student_id):
         for _, topic in student_topics.iterrows():
             topic_id = str(topic['Topic_ID']).strip()
             
-            # Check if this topic is completed by this student
+            # Check if this topic is completed by this student FOR THIS SUBJECT
             is_completed = False
             completed_by = ''
             completed_at = ''
             
             if progress_df is not None and not progress_df.empty:
+                # Look for completion record matching student+topic (and subject if available)
                 completion = progress_df[
                     (progress_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()) &
                     (progress_df['Topic_ID'].astype(str).str.strip() == topic_id)
                 ]
+                
+                # If Progress_Tracker has Subject column, filter by it too
+                if 'Subject' in progress_df.columns and not completion.empty:
+                    completion = completion[
+                        completion['Subject'].astype(str).str.strip() == student_subject
+                    ]
                 
                 if not completion.empty:
                     is_completed = True
@@ -332,15 +352,15 @@ def get_student_plan(student_id):
                     date_val = completion.iloc[0].get('Date_Completed', '')
                     completed_at = formatDate(date_val) if date_val else ''
             
-            # Create plan entry
-            plan_id = f"{student_id}-{topic_id}"
+            # Create plan entry with subject included
+            plan_id = f"{student_id}-{student_subject}-{topic_id}"
             
             plans.append({
                 'planId': plan_id,
                 'topicId': topic_id,
+                'subject': student_subject,
                 'subUnitName': str(topic.get('Sub_Unit_Name', 'Unknown Topic')),
                 'unitName': str(topic.get('Unit_Name', '')),
-                'subject': str(topic.get('Subject', student_subject)),
                 'status': 'Completed' if is_completed else 'Pending',
                 'completedBy': str(completed_by),
                 'dateCompleted': str(completed_at),
@@ -410,14 +430,23 @@ def save_tutor_memo(student_id, class_date, memo_text):
 def mark_topic_complete(plan_id, tutor_id):
     """Mark a topic as completed - saves to Progress_Tracker sheet"""
     try:
-        # Extract student_id and topic_id from plan_id
-        # Format: StudentID-TopicID (e.g., "S01090001-G10C01-1")
-        parts = plan_id.split('-', 1)
-        if len(parts) < 2:
-            return False, "Invalid Plan ID format"
+        # Extract student_id, subject, and topic_id from plan_id
+        # Format: StudentID-Subject-TopicID (e.g., "S01090001-Science-G10C01-1")
+        # Or old format: StudentID-TopicID (for backward compatibility)
+        parts = plan_id.split('-', 2)
         
-        student_id = parts[0]
-        topic_id = parts[1]
+        if len(parts) == 3:
+            # New format with subject
+            student_id = parts[0]
+            subject = parts[1]
+            topic_id = parts[2]
+        elif len(parts) == 2:
+            # Old format without subject
+            student_id = parts[0]
+            topic_id = parts[1]
+            subject = None
+        else:
+            return False, "Invalid Plan ID format"
         
         client = get_google_sheets_client()
         if not client:
@@ -430,8 +459,9 @@ def mark_topic_complete(plan_id, tutor_id):
             worksheet = spreadsheet.worksheet("Progress_Tracker")
         except gspread.exceptions.WorksheetNotFound:
             # Create the sheet if it doesn't exist
-            worksheet = spreadsheet.add_worksheet(title="Progress_Tracker", rows="1000", cols="4")
-            worksheet.append_row(['Student_ID', 'Topic_ID', 'Completed_By', 'Date_Completed'])
+            worksheet = spreadsheet.add_worksheet(title="Progress_Tracker", rows="1000", cols="5")
+            # Add headers with Subject column
+            worksheet.append_row(['Student_ID', 'Topic_ID', 'Subject', 'Completed_By', 'Date_Completed'])
         
         # Check if this completion already exists
         all_data = worksheet.get_all_values()
@@ -442,12 +472,26 @@ def mark_topic_complete(plan_id, tutor_id):
             
             student_col = headers.index('Student_ID') if 'Student_ID' in headers else 0
             topic_col = headers.index('Topic_ID') if 'Topic_ID' in headers else 1
+            subject_col = headers.index('Subject') if 'Subject' in headers else -1
             
             # Check if already completed
             for idx, row in enumerate(data_rows):
-                if (len(row) > max(student_col, topic_col) and
-                    str(row[student_col]).strip() == str(student_id).strip() and
-                    str(row[topic_col]).strip() == str(topic_id).strip()):
+                match = False
+                
+                if len(row) > max(student_col, topic_col):
+                    # Check student and topic match
+                    if (str(row[student_col]).strip() == str(student_id).strip() and
+                        str(row[topic_col]).strip() == str(topic_id).strip()):
+                        
+                        # If subject is available, check it too
+                        if subject and subject_col >= 0 and len(row) > subject_col:
+                            if str(row[subject_col]).strip() == str(subject).strip():
+                                match = True
+                        else:
+                            # No subject column or no subject filter - assume match
+                            match = True
+                
+                if match:
                     # Already completed - update it
                     row_num = idx + 2
                     completed_by_col = headers.index('Completed_By') + 1
@@ -455,6 +499,10 @@ def mark_topic_complete(plan_id, tutor_id):
                     
                     worksheet.update_cell(row_num, completed_by_col, str(tutor_id))
                     worksheet.update_cell(row_num, date_col, datetime.now().strftime('%d/%m/%Y'))
+                    
+                    # If subject column exists and subject is provided, update it
+                    if subject and subject_col >= 0:
+                        worksheet.update_cell(row_num, subject_col + 1, str(subject))
                     
                     # Log the completion
                     log_topic_completion(tutor_id, plan_id, student_id)
@@ -467,7 +515,13 @@ def mark_topic_complete(plan_id, tutor_id):
         
         # Not found - add new row
         current_date = datetime.now().strftime('%d/%m/%Y')
-        worksheet.append_row([student_id, topic_id, str(tutor_id), current_date])
+        
+        # Add row with subject if provided
+        if subject:
+            worksheet.append_row([student_id, topic_id, subject, str(tutor_id), current_date])
+        else:
+            # Backward compatibility - add empty subject
+            worksheet.append_row([student_id, topic_id, '', str(tutor_id), current_date])
         
         # Log the completion activity
         log_topic_completion(tutor_id, plan_id, student_id)
@@ -699,7 +753,7 @@ def show_class_card(cls, unique_key):
                 st.session_state.selected_student = {
                     'id': cls['Student_ID'],
                     'name': cls.get('Student_Name', cls['Student_ID']),
-                    'subject': cls['Subject']
+                    'subject': cls['Subject']  # Pass the subject from the class
                 }
                 st.rerun()
         
@@ -1117,11 +1171,11 @@ def show_student_plan():
     
     student = st.session_state.selected_student
     
-    # Header
+    # Header - show subject being taught
     st.markdown(f'<div class="main-header"><h1>{student["name"]}</h1><p>Subject: {student["subject"]}</p></div>', unsafe_allow_html=True)
     
-    # Load plan
-    plan_df = get_student_plan(student['id'])
+    # Load plan WITH subject filter
+    plan_df = get_student_plan(student['id'], subject_filter=student['subject'])
     
     if plan_df is None or (isinstance(plan_df, pd.DataFrame) and plan_df.empty):
         st.warning("⚠️ No learning plan found for this student")
