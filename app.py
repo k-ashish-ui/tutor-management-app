@@ -298,21 +298,48 @@ def get_student_plan(student_id, subject_filter=None):
         # Get student info - if subject_filter provided, use it
         if subject_filter:
             # Find the specific student+subject combination
-            student = students_df[
-                (students_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()) &
-                (students_df['Subject'].astype(str).str.strip() == str(subject_filter).strip())
-            ]
+            print(f"DEBUG: Filtering by Student_ID={student_id} AND Subject={subject_filter}")
+            print(f"DEBUG: Students sheet has {len(students_df)} rows")
+            print(f"DEBUG: Students sheet columns: {students_df.columns.tolist()}")
+            
+            # Check if Subject column exists
+            if 'Subject' not in students_df.columns:
+                print("WARNING: Subject column not found in Students sheet!")
+                # Fallback to no subject filter
+                student = students_df[students_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()]
+            else:
+                student = students_df[
+                    (students_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()) &
+                    (students_df['Subject'].astype(str).str.strip() == str(subject_filter).strip())
+                ]
+                print(f"DEBUG: Found {len(student)} matching student records")
         else:
             # Get first match (backward compatibility)
             student = students_df[students_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()]
         
         if student.empty:
+            print(f"ERROR: No student found with ID={student_id}, Subject={subject_filter}")
             return pd.DataFrame()
         
         student_grade = str(student.iloc[0].get('Grade', '')).strip()
         student_subject = str(student.iloc[0].get('Subject', '')).strip()
         
+        print(f"DEBUG: Student Grade={student_grade}, Subject={student_subject}")
+        
         # Get all topics for this grade and subject from curriculum
+        print(f"DEBUG: Curriculum has {len(curriculum_df)} topics")
+        
+        # Check if Grade and Subject columns exist in Curriculum
+        if 'Grade' not in curriculum_df.columns or 'Subject' not in curriculum_df.columns:
+            print("WARNING: Grade or Subject column missing in Curriculum_Library!")
+            student_topics = curriculum_df.copy()
+        else:
+            student_topics = curriculum_df[
+                (curriculum_df['Grade'].astype(str).str.strip() == student_grade) &
+                (curriculum_df['Subject'].astype(str).str.strip() == student_subject)
+            ].copy()
+            
+            print(f"DEBUG: Filtered to {len(student_topics)} topics for Grade={student_grade}, Subject={student_subject}")
         student_topics = curriculum_df[
             (curriculum_df['Grade'].astype(str).str.strip() == student_grade) &
             (curriculum_df['Subject'].astype(str).str.strip() == student_subject)
@@ -1176,6 +1203,9 @@ def show_student_plan():
     
     # Load plan WITH subject filter
     plan_df = get_student_plan(student['id'], subject_filter=student['subject'])
+    
+    # DEBUG: Show what subject we're filtering by
+    st.caption(f"🔍 Debug: Loading topics for Grade/Subject based on schedule. Subject from class: {student['subject']}")
     
     if plan_df is None or (isinstance(plan_df, pd.DataFrame) and plan_df.empty):
         st.warning("⚠️ No learning plan found for this student")
