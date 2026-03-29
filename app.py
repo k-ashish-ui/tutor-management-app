@@ -66,6 +66,9 @@ if 'selected_student' not in st.session_state:
     st.session_state.selected_student = None
 if 'admin_mode' not in st.session_state:
     st.session_state.admin_mode = False
+if 'locally_completed' not in st.session_state:
+    # Tracks plan IDs marked done this session so UI updates instantly
+    st.session_state.locally_completed = set()
 
 # Google Sheets connection
 @st.cache_resource
@@ -1026,6 +1029,7 @@ def show_student_plan():
     with col1:
         if st.button("← Back to Dashboard"):
             st.session_state.current_view = 'dashboard'
+            st.session_state.locally_completed = set()
             load_sheet_data.clear()
             st.rerun()
     
@@ -1079,41 +1083,48 @@ def show_student_plan():
     st.markdown("### 📝 Learning Topics")
     
     for idx, topic in plan_df.iterrows():
-        is_completed = topic['status'] == 'Completed'
+        plan_id = topic['planId']
+
+        # A topic is green if the sheet says so OR if we just marked it this session
+        is_completed = (topic['status'] == 'Completed') or (plan_id in st.session_state.locally_completed)
         card_class = "topic-card completed" if is_completed else "topic-card"
-        
+
         st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
-        
+
         col1, col2 = st.columns([4, 1])
-        
+
         with col1:
             st.markdown(f"**{topic.get('subUnitName', 'Unknown Topic')}**")
             if pd.notna(topic.get('unitName')) and topic.get('unitName'):
                 st.caption(f"Unit: {topic['unitName']}")
-            
             if pd.notna(topic.get('contentLink')) and topic.get('contentLink'):
                 st.markdown(f"[📎 View Content]({topic['contentLink']})")
-        
+
         with col2:
             if is_completed:
                 st.success("✓ Done")
-                if topic.get('completedBy'):
+                if topic.get('completedBy') and topic['completedBy'] not in ('', 'nan'):
                     st.caption(f"By: {topic['completedBy']}")
-                if topic.get('dateCompleted'):
+                elif plan_id in st.session_state.locally_completed:
+                    st.caption(f"By: {st.session_state.tutor_id}")
+                if topic.get('dateCompleted') and topic['dateCompleted'] not in ('', 'nan'):
                     st.caption(f"{topic['dateCompleted']}")
+                elif plan_id in st.session_state.locally_completed:
+                    st.caption(datetime.now().strftime('%d/%m/%Y'))
             else:
-                if st.button("Mark Done", key=f"complete_{topic['planId']}", use_container_width=True):
-                    with st.spinner('Updating...'):
-                        success, message = mark_topic_complete(topic['planId'], st.session_state.tutor_id)
-                        if success:
-                            st.success(message)
-                            # Clear all caches immediately before rerun so fresh data is loaded
-                            st.cache_data.clear()
-                            load_sheet_data.clear()
-                            st.rerun()
-                        else:
-                            st.error(message)
-        
+                if st.button("Mark Done", key=f"complete_{plan_id}", use_container_width=True):
+                    with st.spinner('Saving to sheet...'):
+                        success, message = mark_topic_complete(plan_id, st.session_state.tutor_id)
+                    if success:
+                        # Add to local set so it turns green immediately this run
+                        st.session_state.locally_completed.add(plan_id)
+                        # Clear sheet cache so next full load is fresh
+                        st.cache_data.clear()
+                        load_sheet_data.clear()
+                        st.rerun()
+                    else:
+                        st.error(message)
+
         st.markdown('</div>', unsafe_allow_html=True)
 
 # Main App
