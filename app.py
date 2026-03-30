@@ -70,10 +70,9 @@ if 'locally_completed' not in st.session_state:
     # Tracks plan IDs marked done this session so UI updates instantly
     st.session_state.locally_completed = set()
 
-# Google Sheets connection
-@st.cache_resource
+# Google Sheets connection - NOT cached so tokens never go stale
 def get_google_sheets_client():
-    """Connect to Google Sheets using service account credentials"""
+    """Connect to Google Sheets using service account credentials."""
     try:
         creds_dict = st.secrets["gcp_service_account"]
         
@@ -396,91 +395,117 @@ def save_tutor_memo(student_id, class_date, memo_text):
 
 def mark_topic_complete(plan_id, tutor_id):
     """Mark a topic as completed - saves to Progress_Tracker sheet"""
+    # Parse plan_id: format is StudentID-Subject-TopicID
+    parts = plan_id.split('-', 2)
+    if len(parts) == 3:
+        student_id = parts[0]
+        subject = parts[1]
+        topic_id = parts[2]
+    elif len(parts) == 2:
+        student_id = parts[0]
+        topic_id = parts[1]
+        subject = ''
+    else:
+        return False, f"Invalid Plan ID format: {plan_id}"
+
     try:
-        parts = plan_id.split('-', 2)
-        
-        if len(parts) == 3:
-            student_id = parts[0]
-            subject = parts[1]
-            topic_id = parts[2]
-        elif len(parts) == 2:
-            student_id = parts[0]
-            topic_id = parts[1]
-            subject = None
-        else:
-            return False, "Invalid Plan ID format"
-        
         client = get_google_sheets_client()
         if not client:
-            return False, "Cannot connect to Google Sheets"
-            
+            return False, "Cannot connect to Google Sheets - check service account credentials"
+
         spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
-        
+
+        # Get or create Progress_Tracker sheet
         try:
             worksheet = spreadsheet.worksheet("Progress_Tracker")
         except gspread.exceptions.WorksheetNotFound:
             worksheet = spreadsheet.add_worksheet(title="Progress_Tracker", rows="1000", cols="5")
             worksheet.append_row(['Student_ID', 'Topic_ID', 'Subject', 'Completed_By', 'Date_Completed'])
-        
+
         all_data = worksheet.get_all_values()
-        
+        current_date = datetime.now().strftime('%d/%m/%Y')
+
         if len(all_data) > 1:
             headers = all_data[0]
             data_rows = all_data[1:]
-            
-            student_col = headers.index('Student_ID') if 'Student_ID' in headers else 0
-            topic_col = headers.index('Topic_ID') if 'Topic_ID' in headers else 1
-            subject_col = headers.index('Subject') if 'Subject' in headers else -1
-            
-            for idx, row in enumerate(data_rows):
-                match = False
-                
-                if len(row) > max(student_col, topic_col):
-                    if (str(row[student_col]).strip() == str(student_id).strip() and
-                        str(row[topic_col]).strip() == str(topic_id).strip()):
-                        
-                        if subject and subject_col >= 0 and len(row) > subject_col:
-                            if str(row[subject_col]).strip() == str(subject).strip():
-                                match = True
-                        else:
-                            match = True
-                
-                if match:
-                    row_num = idx + 2
-                    completed_by_col = headers.index('Completed_By') + 1
-                    date_col = headers.index('Date_Completed') + 1
-                    
-                    worksheet.update_cell(row_num, completed_by_col, str(tutor_id))
-                    worksheet.update_cell(row_num, date_col, datetime.now().strftime('%d/%m/%Y'))
-                    
-                    if subject and subject_col >= 0:
-                        worksheet.update_cell(row_num, subject_col + 1, str(subject))
-                    
-                    log_topic_completion(tutor_id, plan_id, student_id)
-                    
-                    st.cache_data.clear()
-                    load_sheet_data.clear()
-                    
-                    return True, "Topic marked as completed!"
-        
-        current_date = datetime.now().strftime('%d/%m/%Y')
-        
-        if subject:
-            worksheet.append_row([student_id, topic_id, subject, str(tutor_id), current_date])
-        else:
-            worksheet.append_row([student_id, topic_id, '', str(tutor_id), current_date])
-        
+
+            # Get column indices safely
+            try:
+                student_col = headers.index('Student_ID')
+            except ValueError:
+                student_col = 0
+            try:
+                topic_col = headers.index('Topic_ID')
+            except ValueError:
+                topic_col = 1
+            try:
+                subject_col = headers.index('Subject')
+            except ValueError:
+                subject_col = -1
+            try:
+                completed_by_col = headers.index('Completed_By')
+            except ValueError:
+                completed_by_col = 3
+            try:
+                date_col_idx = headers.index('Date_Completed')
+            except ValueError:
+                date_col_idx = 4
+
+            for row_idx, row in enumerate(data_rows):
+                # Pad short rows
+                while len(row) <= max(student_col, topic_col):
+                    row.append('')
+
+                row_student = str(row[student_col]).strip()
+                row_topic = str(row[topic_col]).strip()
+
+                if row_student != str(student_id).strip() or row_topic != str(topic_id).strip():
+                    continue
+
+                # If subject column exists, also match subject
+                if subject and subject_col >= 0 and len(row) > subject_col:
+                    if str(row[subject_col]).strip() != str(subject).strip():
+                        continue
+
+                # Found existing row - update it using batch_update
+                sheet_row = row_idx + 2  # +1 for header, +1 for 1-based index
+                updates = [
+                    {'range': gspread.utils.rowcol_to_a1(sheet_row, completed_by_col + 1),
+                     'values': [[str(tutor_id)]]},
+                    {'range': gspread.utils.rowcol_to_a1(sheet_row, date_col_idx + 1),
+                     'values': [[current_date]]},
+                ]
+                if subject and subject_col >= 0:
+                    updates.append({
+                        'range': gspread.utils.rowcol_to_a1(sheet_row, subject_col + 1),
+                        'values': [[str(subject)]]
+                    })
+                worksheet.batch_update(updates)
+
+                log_topic_completion(tutor_id, plan_id, student_id)
+                st.cache_data.clear()
+                load_sheet_data.clear()
+                return True, "Topic marked as completed!"
+
+        # No existing row found - append new one
+        worksheet.append_row([
+            str(student_id),
+            str(topic_id),
+            str(subject),
+            str(tutor_id),
+            current_date
+        ])
+
         log_topic_completion(tutor_id, plan_id, student_id)
-        
         st.cache_data.clear()
         load_sheet_data.clear()
-        
         return True, "Topic marked as completed!"
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return False, f"Error updating: {str(e)}"
+        error_msg = str(e)
+        return False, f"Sheet write failed: {error_msg}"
 
 # Login Page
 def show_login():
@@ -1116,14 +1141,14 @@ def show_student_plan():
                     with st.spinner('Saving to sheet...'):
                         success, message = mark_topic_complete(plan_id, st.session_state.tutor_id)
                     if success:
-                        # Add to local set so it turns green immediately this run
                         st.session_state.locally_completed.add(plan_id)
-                        # Clear sheet cache so next full load is fresh
                         st.cache_data.clear()
                         load_sheet_data.clear()
                         st.rerun()
                     else:
-                        st.error(message)
+                        # Show the real error so it can be diagnosed
+                        st.error(f"❌ Save failed: {message}")
+                        st.warning(f"Plan ID attempted: {plan_id}")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
