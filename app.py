@@ -1,4 +1,9 @@
-import streamlit as st
+today = date.today()
+    from datetime import timedelta
+    next_7_days = today + timedelta(days=7)
+    
+    with tab1:
+        today_classes = classes_df[classes_df['Dateimport streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
@@ -942,7 +947,7 @@ def show_admin_panel():
         progress_df = load_sheet_data("Student_Plan")
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Overview", "👥 Tutor Activity", "⚠️ Completion Alerts", "📊 Detailed Logs", "⚙️ System Info"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📈 Overview", "🏆 Team Analytics", "👥 Tutor Activity", "⚠️ Completion Alerts", "📊 Detailed Logs", "⚙️ System Info"])
     
     with tab1:
         st.markdown("### 📊 Quick Statistics")
@@ -962,14 +967,16 @@ def show_admin_panel():
         
         with col3:
             if usage_df is not None and not usage_df.empty:
-                # Topics completed today
-                topics_today = len(usage_df[
-                    (usage_df['Date'] == datetime.now().strftime('%Y-%m-%d')) & 
-                    (usage_df['Action'] == 'Topic_Completed')
-                ])
+                # Topics and memos completed today
+                today_str = datetime.now().strftime('%Y-%m-%d')
+                today_data = usage_df[usage_df['Date'] == today_str]
+                topics_today = len(today_data[today_data['Action'] == 'Topic_Completed'])
+                memos_today = len(today_data[today_data['Action'] == 'Memo_Added'])
             else:
                 topics_today = 0
+                memos_today = 0
             st.metric("✅ Topics Done Today", topics_today)
+            st.caption(f"📝 Memos: {memos_today}")
         
         with col4:
             if usage_df is not None and not usage_df.empty:
@@ -1068,9 +1075,9 @@ def show_admin_panel():
         else:
             st.info("No activity data available yet.")
     
-    with tab3:
-        st.markdown("### ⚠️ Completion Alerts - Tutors with Pending Topics")
-        st.info("Shows tutors who had classes today but haven't marked all topics complete yet")
+    with tab4:
+        st.markdown("### ⚠️ Class Activity Alerts - Topics & Memos")
+        st.info("Shows tutors who had classes today - tracking both topic completion and memo addition")
         
         if schedule_df is not None and not schedule_df.empty and usage_df is not None:
             today_date = datetime.now().date()
@@ -1091,31 +1098,41 @@ def show_admin_panel():
                 for tutor_id in today_classes_df['Tutor_ID'].unique():
                     tutor_id_str = str(tutor_id).strip()
                     
-                    # Get tutor name
+                    # Get tutor name and team
                     tutor_info = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str] if tutors_df is not None and not tutors_df.empty else pd.DataFrame()
                     tutor_name = tutor_info.iloc[0].get('Name', tutor_id) if not tutor_info.empty and 'Name' in tutor_info.columns else tutor_id
+                    tutor_team = tutor_info.iloc[0].get('Team', 'No Team') if not tutor_info.empty and 'Team' in tutor_info.columns else 'No Team'
                     
                     # Count classes today
                     tutor_classes = today_classes_df[today_classes_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str]
                     num_classes = len(tutor_classes)
                     
-                    # Count completions today
-                    completions = usage_df[
+                    # Count completions and memos today
+                    tutor_activity = usage_df[
                         (usage_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str) &
-                        (usage_df['Date'] == today_str) &
-                        (usage_df['Action'] == 'Topic_Completed')
+                        (usage_df['Date'] == today_str)
                     ]
-                    num_completions = len(completions)
+                    
+                    num_topics = len(tutor_activity[tutor_activity['Action'] == 'Topic_Completed'])
+                    num_memos = len(tutor_activity[tutor_activity['Action'] == 'Memo_Added'])
                     
                     # Calculate pending
-                    pending = num_classes - num_completions
+                    topics_pending = num_classes - num_topics
+                    memos_pending = num_classes - num_memos
                     
                     # Alert status
-                    if pending > 0:
-                        status = "⚠️ Behind"
-                        alert_color = "🔴"
-                    elif pending == 0 and num_classes > 0:
-                        status = "✅ On Track"
+                    if topics_pending > 0 or memos_pending > 0:
+                        if topics_pending > 0 and memos_pending > 0:
+                            status = "🔴 Topics & Memos Missing"
+                            alert_color = "🔴"
+                        elif topics_pending > 0:
+                            status = "🟠 Topics Missing"
+                            alert_color = "🟠"
+                        else:
+                            status = "🟡 Memos Missing"
+                            alert_color = "🟡"
+                    elif num_classes > 0:
+                        status = "✅ Complete"
                         alert_color = "🟢"
                     else:
                         status = "➖ No Classes"
@@ -1123,17 +1140,21 @@ def show_admin_panel():
                     
                     alerts.append({
                         'Status': alert_color,
-                        'Tutor_ID': tutor_id,
-                        'Tutor_Name': tutor_name,
-                        'Classes Today': num_classes,
-                        'Topics Completed': num_completions,
-                        'Pending': pending if pending > 0 else 0,
+                        'Tutor': tutor_name,
+                        'Team': tutor_team,
+                        'Classes': num_classes,
+                        'Topics Done': num_topics,
+                        'Memos Done': num_memos,
+                        'Topics Pending': max(topics_pending, 0),
+                        'Memos Pending': max(memos_pending, 0),
                         'Alert': status
                     })
                 
                 alerts_df = pd.DataFrame(alerts)
-                # Sort by pending (highest first)
-                alerts_df = alerts_df.sort_values('Pending', ascending=False)
+                # Sort by most issues first
+                alerts_df['Total_Pending'] = alerts_df['Topics Pending'] + alerts_df['Memos Pending']
+                alerts_df = alerts_df.sort_values('Total_Pending', ascending=False)
+                alerts_df = alerts_df.drop('Total_Pending', axis=1)
                 
                 # Show alerts
                 st.dataframe(
@@ -1143,18 +1164,31 @@ def show_admin_panel():
                 )
                 
                 # Summary
-                behind_count = len(alerts_df[alerts_df['Pending'] > 0])
-                if behind_count > 0:
-                    st.error(f"⚠️ {behind_count} tutor(s) have pending topic completions!")
+                issues_count = len(alerts_df[
+                    (alerts_df['Topics Pending'] > 0) | (alerts_df['Memos Pending'] > 0)
+                ])
+                
+                if issues_count > 0:
+                    st.error(f"⚠️ {issues_count} tutor(s) have pending work!")
+                    
+                    # Breakdown
+                    topic_issues = len(alerts_df[alerts_df['Topics Pending'] > 0])
+                    memo_issues = len(alerts_df[alerts_df['Memos Pending'] > 0])
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.warning(f"📚 {topic_issues} tutor(s) haven't marked all topics complete")
+                    with col2:
+                        st.warning(f"📝 {memo_issues} tutor(s) haven't added all memos")
                 else:
-                    st.success("✅ All tutors are up to date!")
+                    st.success("✅ All tutors completed their topics and memos for today!")
                     
             else:
                 st.info("No classes scheduled for today")
         else:
             st.info("No schedule data available")
     
-    with tab4:
+    with tab5:
         st.markdown("### 📋 Detailed Login Logs")
         
         if usage_df is not None and not usage_df.empty:
