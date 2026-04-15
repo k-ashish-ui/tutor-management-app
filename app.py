@@ -328,7 +328,7 @@ def get_student_plan(student_id, subject_filter=None):
                     date_val = completion.iloc[0].get('Date_Completed', '')
                     completed_at = formatDate(date_val) if date_val else ''
             
-            plan_id = f"{student_id}-{student_subject}-{topic_id}"
+            plan_id = f"{student_id}|||{student_subject}|||{topic_id}"
             
             plans.append({
                 'planId': plan_id,
@@ -398,18 +398,29 @@ def save_tutor_memo(student_id, class_date, memo_text):
 
 def mark_topic_complete(plan_id, tutor_id):
     """Mark a topic as completed - saves to Progress_Tracker sheet"""
-    # Parse plan_id: format is StudentID-Subject-TopicID
-    parts = plan_id.split('-', 2)
-    if len(parts) == 3:
-        student_id = parts[0]
-        subject = parts[1]
-        topic_id = parts[2]
-    elif len(parts) == 2:
-        student_id = parts[0]
-        topic_id = parts[1]
-        subject = ''
+    # Parse plan_id: format is StudentID|||Subject|||TopicID
+    # Using ||| as delimiter since Student_ID, Subject and Topic_ID can all contain hyphens
+    if '|||' in plan_id:
+        parts = plan_id.split('|||')
+        if len(parts) == 3:
+            student_id = parts[0].strip()
+            subject = parts[1].strip()
+            topic_id = parts[2].strip()
+        else:
+            return False, f"Invalid Plan ID format (expected 3 parts): {plan_id}"
     else:
-        return False, f"Invalid Plan ID format: {plan_id}"
+        # Legacy fallback for old hyphen-based IDs
+        parts = plan_id.split('-', 2)
+        if len(parts) == 3:
+            student_id = parts[0].strip()
+            subject = parts[1].strip()
+            topic_id = parts[2].strip()
+        elif len(parts) == 2:
+            student_id = parts[0].strip()
+            topic_id = parts[1].strip()
+            subject = ''
+        else:
+            return False, f"Invalid Plan ID format: {plan_id}"
 
     try:
         client = get_google_sheets_client()
@@ -491,24 +502,26 @@ def mark_topic_complete(plan_id, tutor_id):
                 return True, "Topic marked as completed!"
 
         # No existing row found - append new one
-        worksheet.append_row([
-            str(student_id),
-            str(topic_id),
-            str(subject),
-            str(tutor_id),
-            current_date
-        ])
+        new_row = [str(student_id), str(topic_id), str(subject), str(tutor_id), current_date]
+        result = worksheet.append_row(new_row, value_input_option='RAW')
+
+        # Verify write succeeded by checking the response
+        if result is None:
+            return False, "append_row returned None - write may have failed silently"
 
         log_topic_completion(tutor_id, plan_id, student_id)
         st.cache_data.clear()
         load_sheet_data.clear()
-        return True, "Topic marked as completed!"
+        return True, f"Saved! Row: {new_row}"
 
+    except gspread.exceptions.APIError as e:
+        import traceback
+        traceback.print_exc()
+        return False, f"Google API error: {str(e)}"
     except Exception as e:
         import traceback
         traceback.print_exc()
-        error_msg = str(e)
-        return False, f"Sheet write failed: {error_msg}"
+        return False, f"Unexpected error: {type(e).__name__}: {str(e)}"
 
 # Login Page
 def show_login():
@@ -1378,18 +1391,18 @@ def show_student_plan():
                 elif plan_id in st.session_state.locally_completed:
                     st.caption(datetime.now().strftime('%d/%m/%Y'))
             else:
-                if st.button("Mark Done", key=f"complete_{plan_id}", use_container_width=True):
+                if st.button("Mark Done", key=f"complete_{plan_id.replace('|||', '_')}", use_container_width=True):
                     with st.spinner('Saving to sheet...'):
                         success, message = mark_topic_complete(plan_id, st.session_state.tutor_id)
                     if success:
                         st.session_state.locally_completed.add(plan_id)
                         st.cache_data.clear()
                         load_sheet_data.clear()
+                        st.toast(f"✅ {message}", icon="✅")
                         st.rerun()
                     else:
-                        # Show the real error so it can be diagnosed
                         st.error(f"❌ Save failed: {message}")
-                        st.warning(f"Plan ID attempted: {plan_id}")
+                        st.error(f"Plan ID: {plan_id}")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
