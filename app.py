@@ -70,17 +70,16 @@ if 'locally_completed' not in st.session_state:
     # Tracks plan IDs marked done this session so UI updates instantly
     st.session_state.locally_completed = set()
 
-# Google Sheets connection - NOT cached so tokens never go stale
 def get_google_sheets_client():
-    """Connect to Google Sheets using service account credentials."""
+    """Create a fresh authenticated gspread client.
+    Service account credentials never expire, so this is safe to call per-write.
+    For reads, load_sheet_data caches results to avoid quota hits."""
     try:
         creds_dict = st.secrets["gcp_service_account"]
-        
         scopes = [
             'https://www.googleapis.com/auth/spreadsheets',
             'https://www.googleapis.com/auth/drive'
         ]
-        
         credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
         client = gspread.authorize(credentials)
         return client
@@ -88,16 +87,18 @@ def get_google_sheets_client():
         st.error(f"Error connecting to Google Sheets: {str(e)}")
         return None
 
-@st.cache_data(ttl=60)
+# Cache reads aggressively - 5 min TTL means at most 12 reads/hour per sheet.
+# Writes always bypass this cache and call the API directly.
+@st.cache_data(ttl=300)
 def load_sheet_data(sheet_name):
-    """Load data from a specific sheet"""
+    """Load data from a specific sheet. Results cached for 5 minutes to stay within quota."""
     try:
         client = get_google_sheets_client()
         if not client:
             return None
-        
+
         spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
-        
+
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.exceptions.WorksheetNotFound:
@@ -107,16 +108,18 @@ def load_sheet_data(sheet_name):
                     worksheet = spreadsheet.worksheet(ws_name)
                     break
             else:
-                st.error(f"Sheet '{sheet_name}' not found. Available sheets: {', '.join(all_sheets)}")
+                # Don't st.error for missing optional sheets - just return None silently
                 return None
-        
+
         data = worksheet.get_all_records()
         df = pd.DataFrame(data)
         df.columns = df.columns.str.strip()
-        
         return df
     except Exception as e:
-        st.error(f"Error loading {sheet_name}: {str(e)}")
+        # Only show error for non-quota issues so quota errors don't spam the UI
+        err = str(e)
+        if '429' not in err:
+            st.error(f"Error loading {sheet_name}: {err}")
         return None
 
 def authenticate_tutor(tutor_id, password):
@@ -592,7 +595,7 @@ def show_dashboard():
     with col2:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🔄 Refresh", use_container_width=True):
-            load_sheet_data.clear()
+            st.cache_data.clear()
             st.rerun()
     with col3:
         st.markdown("<br>", unsafe_allow_html=True)
