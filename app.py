@@ -249,6 +249,28 @@ def parse_date(date_str):
     
     return None
 
+def read_progress_tracker_fresh():
+    """Read Progress_Tracker directly from sheet, bypassing cache.
+    Used for checking completions so marks show immediately after saving."""
+    try:
+        client = get_google_sheets_client()
+        if not client:
+            return None
+        spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
+        try:
+            worksheet = spreadsheet.worksheet("Progress_Tracker")
+        except gspread.exceptions.WorksheetNotFound:
+            return None
+        data = worksheet.get_all_records()
+        if not data:
+            return None
+        df = pd.DataFrame(data)
+        df.columns = df.columns.str.strip()
+        return df
+    except Exception:
+        return None
+
+
 def get_student_plan(student_id, subject_filter=None):
     """Get learning plan for a specific student - automatically generated from curriculum"""
     try:
@@ -257,7 +279,9 @@ def get_student_plan(student_id, subject_filter=None):
             students_df = load_sheet_data("Students")
         
         curriculum_df = load_sheet_data("Curriculum_Library")
-        progress_df = load_sheet_data("Progress_Tracker")
+        # Always read Progress_Tracker fresh (no cache) so completed topics
+        # show immediately after being marked, without waiting for TTL to expire
+        progress_df = read_progress_tracker_fresh()
         
         if students_df is None or curriculum_df is None:
             return pd.DataFrame()
