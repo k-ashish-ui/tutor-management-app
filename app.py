@@ -1329,20 +1329,36 @@ def show_admin_panel():
 
     with tab5:
         st.markdown("### 📅 Tutor Attendance — Classes Completed Per Month")
-        st.info("A class counts as **completed** only when the tutor has BOTH marked a topic done AND written a memo for that class.")
+        st.info("A class counts as **completed** only when the tutor has BOTH marked a topic done AND written a memo for that class. Click any tutor row to see full class-by-class detail.")
 
         if schedule_df is None or schedule_df.empty:
             st.warning("No schedule data available")
         elif tutors_df is None or tutors_df.empty:
             st.warning("No tutor data available")
         else:
-            from datetime import timedelta
+            # ── Build student name lookup ──────────────────────────────────────
+            students_df_att = load_sheet_data("Students ")
+            if students_df_att is None or students_df_att.empty:
+                students_df_att = load_sheet_data("Students")
 
-            # Build attendance data: for every past/today class, check topic + memo
-            # "Done" = Tutor_Memo is filled AND at least one topic was marked for that student on that date
-            # We use Usage_Log Topic_Completed entries matched by date + student
+            def get_student_name_att(student_id, subject=''):
+                if students_df_att is None or students_df_att.empty:
+                    return str(student_id)
+                sid = str(student_id).strip()
+                subj = str(subject).strip()
+                if subj and 'Subject' in students_df_att.columns:
+                    m = students_df_att[
+                        (students_df_att['Student_ID'].astype(str).str.strip() == sid) &
+                        (students_df_att['Subject'].astype(str).str.strip() == subj)
+                    ]
+                    if not m.empty and 'Student_Name' in m.columns:
+                        return str(m.iloc[0]['Student_Name']).strip()
+                m = students_df_att[students_df_att['Student_ID'].astype(str).str.strip() == sid]
+                if not m.empty and 'Student_Name' in m.columns:
+                    return str(m.iloc[0]['Student_Name']).strip()
+                return sid
 
-            # Get all unique months in schedule
+            # ── Month selector ─────────────────────────────────────────────────
             all_months = set()
             for _, row in schedule_df.iterrows():
                 d = parse_date(str(row.get('Date', '')))
@@ -1353,13 +1369,13 @@ def show_admin_panel():
             if not all_months:
                 st.warning("No valid dates found in Schedule")
             else:
-                # Month selector
-                month_labels = [f"{datetime(y, m, 1).strftime('%B %Y')}" for y, m in all_months]
-                selected_label = st.selectbox("Select Month", month_labels, index=0)
+                month_labels = [datetime(y, m, 1).strftime('%B %Y') for y, m in all_months]
+                col_m, col_t = st.columns([2, 2])
+                with col_m:
+                    selected_label = st.selectbox("Select Month", month_labels, index=0)
                 sel_idx = month_labels.index(selected_label)
                 sel_year, sel_month = all_months[sel_idx]
 
-                # Filter schedule to selected month
                 def in_selected_month(d_str):
                     d = parse_date(str(d_str))
                     return d is not None and d.year == sel_year and d.month == sel_month
@@ -1369,8 +1385,47 @@ def show_admin_panel():
                 if month_schedule.empty:
                     st.info(f"No classes scheduled in {selected_label}")
                 else:
-                    # Build per-tutor attendance rows
+                    # ── Helper: classify a single class row ───────────────────
+                    def classify_class(cls, tutor_id):
+                        cls_date = parse_date(str(cls.get('Date', '')))
+                        student_id_cls = str(cls.get('Student_ID', '')).strip()
+                        has_memo = str(cls.get('Tutor_Memo', '')).strip() not in ('', 'nan', 'none', 'None', '')
+
+                        has_topic = False
+                        topic_timestamp = ''
+                        if usage_df is not None and not usage_df.empty and cls_date:
+                            cls_date_fmt = cls_date.strftime('%Y-%m-%d')
+                            topic_logs = usage_df[
+                                (usage_df['Tutor_ID'].astype(str).str.strip() == tutor_id) &
+                                (usage_df['Action'] == 'Topic_Completed') &
+                                (usage_df['Date'].astype(str).str.strip() == cls_date_fmt)
+                            ]
+                            if not topic_logs.empty:
+                                # Try to match by student ID in Details field
+                                matched = topic_logs[topic_logs['Details'].astype(str).str.contains(student_id_cls, case=False, na=False)]
+                                if not matched.empty:
+                                    has_topic = True
+                                    topic_timestamp = str(matched.iloc[0].get('Timestamp', ''))
+                                else:
+                                    # Fall back: any completion by this tutor on this date counts
+                                    has_topic = True
+                                    topic_timestamp = str(topic_logs.iloc[0].get('Timestamp', ''))
+
+                        if has_memo and has_topic:
+                            status = '✅ Complete'
+                        elif has_memo:
+                            status = '📝 Memo Only'
+                        elif has_topic:
+                            status = '📚 Topic Only'
+                        else:
+                            status = '❌ Incomplete'
+
+                        return has_memo, has_topic, status, topic_timestamp
+
+                    # ── Build summary rows ────────────────────────────────────
                     attendance_rows = []
+                    # Store per-class detail keyed by tutor_id for drill-down
+                    tutor_detail_map = {}
 
                     for tutor_id in sorted(month_schedule['Tutor_ID'].astype(str).str.strip().unique()):
                         tutor_info = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == tutor_id]
@@ -1379,69 +1434,70 @@ def show_admin_panel():
 
                         tutor_month_classes = month_schedule[
                             month_schedule['Tutor_ID'].astype(str).str.strip() == tutor_id
-                        ]
+                        ].copy()
 
                         total = len(tutor_month_classes)
-                        done = 0        # both topic + memo
-                        memo_only = 0   # memo but no topic logged
-                        topic_only = 0  # topic logged but no memo
-                        neither = 0     # nothing done
+                        done = memo_only = topic_only = neither = 0
+                        detail_rows = []
 
                         for _, cls in tutor_month_classes.iterrows():
-                            cls_date_str = str(cls.get('Date', '')).strip()
-                            cls_date = parse_date(cls_date_str)
-                            student_id_cls = str(cls.get('Student_ID', '')).strip()
+                            has_memo, has_topic, status, topic_ts = classify_class(cls, tutor_id)
 
-                            has_memo = str(cls.get('Tutor_Memo', '')).strip() not in ('', 'nan', 'none', 'None')
-
-                            # Check if a topic was completed for this student by this tutor on/around this date
-                            has_topic = False
-                            if usage_df is not None and not usage_df.empty and cls_date:
-                                cls_date_fmt = cls_date.strftime('%Y-%m-%d')
-                                topic_logs = usage_df[
-                                    (usage_df['Tutor_ID'].astype(str).str.strip() == tutor_id) &
-                                    (usage_df['Action'] == 'Topic_Completed') &
-                                    (usage_df['Date'].astype(str).str.strip() == cls_date_fmt)
-                                ]
-                                # Check details field for student ID match
-                                if not topic_logs.empty:
-                                    for _, tl in topic_logs.iterrows():
-                                        details = str(tl.get('Details', '')).lower()
-                                        if student_id_cls.lower() in details:
-                                            has_topic = True
-                                            break
-                                    if not has_topic:
-                                        # If details don't match, count any topic completion that day as valid
-                                        has_topic = True
-
-                            if has_memo and has_topic:
+                            if status == '✅ Complete':
                                 done += 1
-                            elif has_memo and not has_topic:
+                            elif status == '📝 Memo Only':
                                 memo_only += 1
-                            elif has_topic and not has_memo:
+                            elif status == '📚 Topic Only':
                                 topic_only += 1
                             else:
                                 neither += 1
 
+                            cls_date_obj = parse_date(str(cls.get('Date', '')))
+                            student_id_cls = str(cls.get('Student_ID', '')).strip()
+                            subject_cls = str(cls.get('Subject', '')).strip()
+                            student_name = get_student_name_att(student_id_cls, subject_cls)
+
+                            # Memo timestamp: not stored separately, so we show the schedule date
+                            memo_text = str(cls.get('Tutor_Memo', '')).strip()
+                            if memo_text in ('nan', 'none', 'None'):
+                                memo_text = ''
+
+                            detail_rows.append({
+                                'Class Date': cls_date_obj.strftime('%d/%m/%Y') if cls_date_obj else str(cls.get('Date', '')),
+                                'Time': f"{cls.get('Start_Time', 'N/A')} – {cls.get('End_Time', 'N/A')}",
+                                'Student': student_name,
+                                'Student ID': student_id_cls,
+                                'Subject': subject_cls,
+                                'Status': status,
+                                '📚 Topic Marked At': topic_ts if has_topic else '—',
+                                '📝 Memo': '✅ Yes' if has_memo else '❌ No',
+                                'Memo Text': memo_text if memo_text else '—',
+                            })
+
                         pct = round(done / total * 100, 1) if total > 0 else 0.0
+                        tutor_detail_map[tutor_id] = {
+                            'name': tutor_name,
+                            'detail': detail_rows
+                        }
 
                         attendance_rows.append({
+                            '_tutor_id': tutor_id,
                             'Tutor': tutor_name,
                             'Team': team,
                             'Total Classes': total,
-                            '✅ Fully Done': done,
+                            '✅ Complete': done,
                             '📝 Memo Only': memo_only,
                             '📚 Topic Only': topic_only,
-                            '❌ Neither': neither,
+                            '❌ Incomplete': neither,
                             'Completion %': pct
                         })
 
                     att_df = pd.DataFrame(attendance_rows).sort_values('Completion %', ascending=False)
 
-                    # Summary metrics
+                    # ── Summary metrics ───────────────────────────────────────
                     c1, c2, c3, c4 = st.columns(4)
                     total_classes_month = att_df['Total Classes'].sum()
-                    total_done_month = att_df['✅ Fully Done'].sum()
+                    total_done_month = att_df['✅ Complete'].sum()
                     with c1:
                         st.metric("📅 Total Classes", int(total_classes_month))
                     with c2:
@@ -1450,28 +1506,91 @@ def show_admin_panel():
                         pct_overall = round(total_done_month / total_classes_month * 100, 1) if total_classes_month > 0 else 0
                         st.metric("📊 Overall %", f"{pct_overall}%")
                     with c4:
-                        perfect = len(att_df[att_df['Completion %'] == 100])
+                        perfect = len(att_df[att_df['Completion %'] == 100.0])
                         st.metric("🌟 Tutors at 100%", perfect)
 
                     st.markdown("---")
-                    st.dataframe(att_df, use_container_width=True, hide_index=True)
 
-                    # Per-team summary for the month
+                    # ── Summary table (hide internal _tutor_id col) ───────────
+                    display_att = att_df.drop(columns=['_tutor_id'])
+                    st.dataframe(display_att, use_container_width=True, hide_index=True)
+
+                    # ── Per-team summary ──────────────────────────────────────
                     st.markdown("#### By Team")
-                    if 'Team' in att_df.columns:
-                        team_att = att_df.groupby('Team').agg(
-                            Tutors=('Tutor', 'count'),
-                            Total_Classes=('Total Classes', 'sum'),
-                            Done=('✅ Fully Done', 'sum')
-                        ).reset_index()
-                        team_att['Completion %'] = (team_att['Done'] / team_att['Total_Classes'] * 100).round(1).fillna(0)
-                        team_att = team_att.sort_values('Completion %', ascending=False)
-                        st.dataframe(team_att, use_container_width=True, hide_index=True)
+                    team_att = att_df.groupby('Team').agg(
+                        Tutors=('Tutor', 'count'),
+                        Total_Classes=('Total Classes', 'sum'),
+                        Done=('✅ Complete', 'sum')
+                    ).reset_index()
+                    team_att['Completion %'] = (team_att['Done'] / team_att['Total_Classes'] * 100).round(1).fillna(0)
+                    team_att = team_att.sort_values('Completion %', ascending=False)
+                    st.dataframe(team_att, use_container_width=True, hide_index=True)
 
-                    # Download
-                    csv = att_df.to_csv(index=False)
+                    # ── Drill-down: select a tutor ────────────────────────────
+                    st.markdown("---")
+                    st.markdown("#### 🔍 Class-by-Class Detail (for payment verification)")
+
+                    tutor_options = {row['Tutor']: row['_tutor_id'] for _, row in att_df.iterrows()}
+                    selected_tutor_name = st.selectbox(
+                        "Select a tutor to see full class breakdown",
+                        options=list(tutor_options.keys()),
+                        index=0
+                    )
+                    selected_tutor_id = tutor_options[selected_tutor_name]
+                    detail_data = tutor_detail_map[selected_tutor_id]['detail']
+
+                    if not detail_data:
+                        st.info("No classes found for this tutor in the selected month.")
+                    else:
+                        detail_df = pd.DataFrame(detail_data).sort_values('Class Date')
+
+                        # Colour-coded status summary
+                        done_count = sum(1 for r in detail_data if r['Status'] == '✅ Complete')
+                        total_count = len(detail_data)
+                        st.markdown(
+                            f"**{selected_tutor_name}** — "
+                            f"**{done_count} / {total_count}** classes fully completed in {selected_label}"
+                        )
+
+                        # Status filter
+                        status_filter = st.multiselect(
+                            "Filter by status",
+                            options=['✅ Complete', '📝 Memo Only', '📚 Topic Only', '❌ Incomplete'],
+                            default=['✅ Complete', '📝 Memo Only', '📚 Topic Only', '❌ Incomplete']
+                        )
+                        filtered_detail = detail_df[detail_df['Status'].isin(status_filter)]
+
+                        st.dataframe(
+                            filtered_detail,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                'Class Date':        st.column_config.TextColumn('Class Date', width='small'),
+                                'Time':              st.column_config.TextColumn('Time', width='small'),
+                                'Student':           st.column_config.TextColumn('Student', width='medium'),
+                                'Student ID':        st.column_config.TextColumn('Student ID', width='small'),
+                                'Subject':           st.column_config.TextColumn('Subject', width='small'),
+                                'Status':            st.column_config.TextColumn('Status', width='medium'),
+                                '📚 Topic Marked At': st.column_config.TextColumn('Topic Marked At', width='medium'),
+                                '📝 Memo':           st.column_config.TextColumn('Memo Filed', width='small'),
+                                'Memo Text':         st.column_config.TextColumn('Memo Content', width='large'),
+                            }
+                        )
+
+                        # Download this tutor's detail
+                        csv_detail = filtered_detail.to_csv(index=False)
+                        st.download_button(
+                            label=f"📥 Download {selected_tutor_name}'s Detail CSV",
+                            data=csv_detail,
+                            file_name=f"attendance_{selected_tutor_name.replace(' ','_')}_{selected_label.replace(' ','_')}.csv",
+                            mime="text/csv"
+                        )
+
+                    st.markdown("---")
+                    # Full month download
+                    csv = att_df.drop(columns=['_tutor_id']).to_csv(index=False)
                     st.download_button(
-                        label="📥 Download Attendance CSV",
+                        label="📥 Download Full Month Summary CSV",
                         data=csv,
                         file_name=f"attendance_{selected_label.replace(' ', '_')}.csv",
                         mime="text/csv"
