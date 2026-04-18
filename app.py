@@ -225,11 +225,26 @@ def get_tutor_classes(tutor_id):
         students_df = load_sheet_data("Students")
     
     if students_df is not None and not students_df.empty:
-        student_map = dict(zip(
-            students_df['Student_ID'].astype(str).str.strip(), 
-            students_df['Student_Name'].astype(str).str.strip()
-        ))
-        tutor_classes['Student_Name'] = tutor_classes['Student_ID'].astype(str).str.strip().map(student_map)
+        # Build name map keyed by (Student_ID, Subject) so we get the right row
+        # when a student appears multiple times with different subjects
+        def get_student_name(row):
+            sid = str(row['Student_ID']).strip()
+            subj = str(row.get('Subject', '')).strip()
+            # Try exact match on student_id + subject first
+            if subj and 'Subject' in students_df.columns:
+                match = students_df[
+                    (students_df['Student_ID'].astype(str).str.strip() == sid) &
+                    (students_df['Subject'].astype(str).str.strip() == subj)
+                ]
+                if not match.empty and 'Student_Name' in match.columns:
+                    return str(match.iloc[0]['Student_Name']).strip()
+            # Fallback: any row for this student
+            match = students_df[students_df['Student_ID'].astype(str).str.strip() == sid]
+            if not match.empty and 'Student_Name' in match.columns:
+                return str(match.iloc[0]['Student_Name']).strip()
+            return sid
+
+        tutor_classes['Student_Name'] = tutor_classes.apply(get_student_name, axis=1)
     
     return tutor_classes
 
@@ -324,8 +339,10 @@ def get_student_plan(student_id, subject_filter=None):
             print(f"DEBUG: Filtered to {len(student_topics)} topics for Grade={student_grade}, Subject={student_subject}")
         
         if student_topics.empty:
-            student_topics = curriculum_df.copy()
-        
+            # No topics found for this grade+subject — return empty, don't show all topics
+            print(f"WARNING: No curriculum topics found for Grade={student_grade}, Subject={student_subject}")
+            return pd.DataFrame()
+
         plans = []
         
         for _, topic in student_topics.iterrows():
@@ -746,7 +763,7 @@ def show_class_card(cls, unique_key):
                 st.session_state.selected_student = {
                     'id': cls['Student_ID'],
                     'name': cls.get('Student_Name', cls['Student_ID']),
-                    'subject': cls['Subject']
+                    'subject': cls.get('Subject', '')
                 }
                 st.rerun()
         
@@ -1490,7 +1507,14 @@ def show_student_plan():
     
     st.markdown(f'<div class="main-header"><h1>{student["name"]}</h1><p>Subject: {student["subject"]}</p></div>', unsafe_allow_html=True)
     
-    plan_df = get_student_plan(student['id'], subject_filter=student['subject'])
+    # subject comes directly from Schedule sheet's Subject column for this class
+    # This ensures tutor only sees topics for the subject they are teaching
+    class_subject = student.get('subject', '').strip()
+    if not class_subject:
+        st.error("⚠️ No Subject found for this class in the Schedule sheet. Please add a 'Subject' column to your Schedule sheet.")
+        return
+
+    plan_df = get_student_plan(student['id'], subject_filter=class_subject)
     
     
     if plan_df is None or (isinstance(plan_df, pd.DataFrame) and plan_df.empty):
