@@ -69,6 +69,13 @@ if 'admin_mode' not in st.session_state:
 if 'locally_completed' not in st.session_state:
     # Tracks plan IDs marked done this session so UI updates instantly
     st.session_state.locally_completed = set()
+if 'progress_cache' not in st.session_state:
+    # Caches the Progress_Tracker dataframe in session — loaded once per student view
+    # Updated immediately when a topic is marked, so no re-read needed
+    st.session_state.progress_cache = None
+if 'progress_cache_key' not in st.session_state:
+    # Key = "student_id|||subject" — tells us when to reload
+    st.session_state.progress_cache_key = None
 
 def get_google_sheets_client():
     """Create a fresh authenticated gspread client.
@@ -266,7 +273,7 @@ def parse_date(date_str):
 
 def read_progress_tracker_fresh():
     """Read Progress_Tracker directly from sheet, bypassing cache.
-    Used for checking completions so marks show immediately after saving."""
+    Returns DataFrame or None. Logs real error instead of silently swallowing it."""
     try:
         client = get_google_sheets_client()
         if not client:
@@ -276,13 +283,20 @@ def read_progress_tracker_fresh():
             worksheet = spreadsheet.worksheet("Progress_Tracker")
         except gspread.exceptions.WorksheetNotFound:
             return None
-        data = worksheet.get_all_records()
-        if not data:
-            return None
-        df = pd.DataFrame(data)
-        df.columns = df.columns.str.strip()
+        # Use get_all_values instead of get_all_records — more robust,
+        # handles blank rows and column name mismatches
+        all_values = worksheet.get_all_values()
+        if not all_values or len(all_values) < 2:
+            # Sheet exists but has no data rows yet
+            return pd.DataFrame(columns=['Student_ID', 'Topic_ID', 'Subject', 'Completed_By', 'Date_Completed'])
+        headers = [h.strip() for h in all_values[0]]
+        rows = all_values[1:]
+        # Pad rows that are shorter than headers
+        padded = [r + [''] * (len(headers) - len(r)) for r in rows]
+        df = pd.DataFrame(padded, columns=headers)
         return df
-    except Exception:
+    except Exception as e:
+        print(f"read_progress_tracker_fresh error: {e}")
         return None
 
 
@@ -294,9 +308,18 @@ def get_student_plan(student_id, subject_filter=None):
             students_df = load_sheet_data("Students")
         
         curriculum_df = load_sheet_data("Curriculum_Library")
-        # Always read Progress_Tracker fresh (no cache) so completed topics
-        # show immediately after being marked, without waiting for TTL to expire
-        progress_df = read_progress_tracker_fresh()
+        # Use session-state cache for Progress_Tracker.
+        # It is loaded fresh once when you open a student's page,
+        # and updated in-memory immediately when a topic is marked —
+        # so we never need a second API call on the same session.
+        cache_key = f"{student_id}|||{subject_filter or ''}"
+        if (st.session_state.get('progress_cache_key') != cache_key or
+                st.session_state.get('progress_cache') is None):
+            progress_df = read_progress_tracker_fresh()
+            st.session_state.progress_cache = progress_df
+            st.session_state.progress_cache_key = cache_key
+        else:
+            progress_df = st.session_state.progress_cache
         
         if students_df is None or curriculum_df is None:
             return pd.DataFrame()
@@ -353,16 +376,16 @@ def get_student_plan(student_id, subject_filter=None):
             completed_at = ''
             
             if progress_df is not None and not progress_df.empty:
+                # Match on Student_ID + Topic_ID only.
+                # Do NOT filter by Subject here — the subject string written to the sheet
+                # comes from the Schedule, while student_subject comes from the Students sheet.
+                # Any whitespace or casing difference between the two would cause the match
+                # to silently fail, making completed topics appear unmarked after re-login.
                 completion = progress_df[
                     (progress_df['Student_ID'].astype(str).str.strip() == str(student_id).strip()) &
                     (progress_df['Topic_ID'].astype(str).str.strip() == topic_id)
                 ]
-                
-                if 'Subject' in progress_df.columns and not completion.empty:
-                    completion = completion[
-                        completion['Subject'].astype(str).str.strip() == student_subject
-                    ]
-                
+
                 if not completion.empty:
                     is_completed = True
                     completed_by = completion.iloc[0].get('Completed_By', '')
@@ -537,6 +560,26 @@ def mark_topic_complete(plan_id, tutor_id):
                     })
                 worksheet.batch_update(updates)
 
+                # Update in-memory session cache for this row too
+                if st.session_state.get('progress_cache') is not None:
+                    cache = st.session_state.progress_cache
+                    mask = (
+                        (cache['Student_ID'].astype(str).str.strip() == str(student_id).strip()) &
+                        (cache['Topic_ID'].astype(str).str.strip() == str(topic_id).strip())
+                    )
+                    if mask.any():
+                        st.session_state.progress_cache.loc[mask, 'Completed_By'] = str(tutor_id)
+                        st.session_state.progress_cache.loc[mask, 'Date_Completed'] = current_date
+                    else:
+                        new_record = pd.DataFrame([{
+                            'Student_ID': str(student_id), 'Topic_ID': str(topic_id),
+                            'Subject': str(subject), 'Completed_By': str(tutor_id),
+                            'Date_Completed': current_date
+                        }])
+                        st.session_state.progress_cache = pd.concat(
+                            [st.session_state.progress_cache, new_record], ignore_index=True
+                        )
+
                 log_topic_completion(tutor_id, plan_id, student_id)
                 st.cache_data.clear()
                 load_sheet_data.clear()
@@ -544,16 +587,29 @@ def mark_topic_complete(plan_id, tutor_id):
 
         # No existing row found - append new one
         new_row = [str(student_id), str(topic_id), str(subject), str(tutor_id), current_date]
-        result = worksheet.append_row(new_row, value_input_option='RAW')
+        worksheet.append_row(new_row, value_input_option='RAW')
 
-        # Verify write succeeded by checking the response
-        if result is None:
-            return False, "append_row returned None - write may have failed silently"
+        # Update in-memory session cache immediately so the next rerun
+        # shows this topic as completed without needing another API call
+        new_record = {
+            'Student_ID': str(student_id),
+            'Topic_ID': str(topic_id),
+            'Subject': str(subject),
+            'Completed_By': str(tutor_id),
+            'Date_Completed': current_date
+        }
+        if st.session_state.get('progress_cache') is not None:
+            st.session_state.progress_cache = pd.concat(
+                [st.session_state.progress_cache, pd.DataFrame([new_record])],
+                ignore_index=True
+            )
+        else:
+            st.session_state.progress_cache = pd.DataFrame([new_record])
 
         log_topic_completion(tutor_id, plan_id, student_id)
         st.cache_data.clear()
         load_sheet_data.clear()
-        return True, f"Saved! Row: {new_row}"
+        return True, "Topic marked as completed!"
 
     except gspread.exceptions.APIError as e:
         import traceback
@@ -656,6 +712,9 @@ def show_dashboard():
         if st.button("🚪 Logout", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.tutor_id = None
+            st.session_state.locally_completed = set()
+            st.session_state.progress_cache = None
+            st.session_state.progress_cache_key = None
             st.rerun()
     
     classes_df = get_tutor_classes(st.session_state.tutor_id)
@@ -1488,6 +1547,8 @@ def show_student_plan():
         if st.button("← Back to Dashboard"):
             st.session_state.current_view = 'dashboard'
             st.session_state.locally_completed = set()
+            st.session_state.progress_cache = None
+            st.session_state.progress_cache_key = None
             load_sheet_data.clear()
             st.rerun()
     
@@ -1501,6 +1562,9 @@ def show_student_plan():
         if st.button("🚪 Logout", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.tutor_id = None
+            st.session_state.locally_completed = set()
+            st.session_state.progress_cache = None
+            st.session_state.progress_cache_key = None
             st.rerun()
     
     student = st.session_state.selected_student
