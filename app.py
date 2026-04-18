@@ -347,6 +347,8 @@ def get_student_plan(student_id, subject_filter=None):
         
         student_grade = str(student.iloc[0].get('Grade', '')).strip()
         student_subject = str(student.iloc[0].get('Subject', '')).strip()
+        # Normalize subject to remove any accidental trailing/leading spaces
+        # (Curriculum_Library has 'Science ' with trailing space in some rows)
         
         print(f"DEBUG: Student Grade={student_grade}, Subject={student_subject}")
         print(f"DEBUG: Curriculum has {len(curriculum_df)} topics")
@@ -357,7 +359,7 @@ def get_student_plan(student_id, subject_filter=None):
         else:
             student_topics = curriculum_df[
                 (curriculum_df['Grade'].astype(str).str.strip() == student_grade) &
-                (curriculum_df['Subject'].astype(str).str.strip() == student_subject)
+                (curriculum_df['Subject'].astype(str).str.strip() == student_subject.strip())
             ].copy()
             print(f"DEBUG: Filtered to {len(student_topics)} topics for Grade={student_grade}, Subject={student_subject}")
         
@@ -498,7 +500,7 @@ def mark_topic_complete(plan_id, tutor_id):
             worksheet = spreadsheet.worksheet("Progress_Tracker")
         except gspread.exceptions.WorksheetNotFound:
             worksheet = spreadsheet.add_worksheet(title="Progress_Tracker", rows="1000", cols="5")
-            worksheet.append_row(['Student_ID', 'Topic_ID', 'Subject', 'Completed_By', 'Date_Completed'])
+            worksheet.append_row(['Student_ID', 'Topic_ID', 'Completed_By', 'Date_Completed', 'Subject'])
 
         all_data = worksheet.get_all_values()
         current_date = datetime.now().strftime('%d/%m/%Y')
@@ -586,7 +588,8 @@ def mark_topic_complete(plan_id, tutor_id):
                 return True, "Topic marked as completed!"
 
         # No existing row found - append new one
-        new_row = [str(student_id), str(topic_id), str(subject), str(tutor_id), current_date]
+        # Column order matches sheet: Student_ID, Topic_ID, Completed_By, Date_Completed, Subject
+        new_row = [str(student_id), str(topic_id), str(tutor_id), current_date, str(subject)]
         worksheet.append_row(new_row, value_input_option='RAW')
 
         # Update in-memory session cache immediately so the next rerun
@@ -594,9 +597,9 @@ def mark_topic_complete(plan_id, tutor_id):
         new_record = {
             'Student_ID': str(student_id),
             'Topic_ID': str(topic_id),
-            'Subject': str(subject),
             'Completed_By': str(tutor_id),
-            'Date_Completed': current_date
+            'Date_Completed': current_date,
+            'Subject': str(subject)
         }
         if st.session_state.get('progress_cache') is not None:
             st.session_state.progress_cache = pd.concat(
@@ -800,7 +803,7 @@ def show_class_card(cls, unique_key):
         
         with col1:
             st.markdown(f"### {cls.get('Student_Name', cls['Student_ID'])}")
-            st.markdown(f"📅 **Date:** {cls['Date']} | 🕐 **Time:** {cls.get('Start_Time', 'N/A')} - {cls.get('End_Time', 'N/A')}")
+            st.markdown(f"📅 **Date:** {cls['Date']} | 🕐 **Time:** {cls.get('Start_Time', 'N/A')}")
             st.markdown(f"📖 **Subject:** {cls['Subject']}")
             st.markdown(f"🆔 **Student ID:** {cls['Student_ID']}")
             
@@ -904,16 +907,20 @@ def show_admin_login():
         st.info("💡 Default admin password is set in Streamlit secrets. Contact system administrator if you don't have it.")
 
 def get_team_for_tutor(tutor_id_str, tutors_df):
-    """Return the team name for a given tutor, or 'Unassigned'."""
-    if tutors_df is None or tutors_df.empty or 'Team' not in tutors_df.columns:
+    """Return the team name for a given tutor, or 'Unassigned'.
+    Handles trailing spaces in the Team column name (sheet has 'Team ').
+    """
+    if tutors_df is None or tutors_df.empty:
+        return 'Unassigned'
+    # Find Team column tolerating trailing/leading spaces
+    team_col = next((c for c in tutors_df.columns if c.strip().lower() == 'team'), None)
+    if team_col is None:
         return 'Unassigned'
     row = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == tutor_id_str]
     if row.empty:
         return 'Unassigned'
-    val = str(row.iloc[0].get('Team', '')).strip()
-    return val if val else 'Unassigned'
-
-
+    val = str(row.iloc[0][team_col]).strip()
+    return val if val and val.lower() != 'nan' else 'Unassigned'
 def show_admin_panel():
     """Admin dashboard with usage analytics"""
     
@@ -1401,15 +1408,45 @@ def show_admin_panel():
                                 (usage_df['Date'].astype(str).str.strip() == cls_date_fmt)
                             ]
                             if not topic_logs.empty:
-                                # Try to match by student ID in Details field
-                                matched = topic_logs[topic_logs['Details'].astype(str).str.contains(student_id_cls, case=False, na=False)]
-                                if not matched.empty:
-                                    has_topic = True
-                                    topic_timestamp = str(matched.iloc[0].get('Timestamp', ''))
+                                # Find the Details column case-insensitively
+                                details_col = None
+                                for col in topic_logs.columns:
+                                    if col.strip().lower() == 'details':
+                                        details_col = col
+                                        break
+
+                                # Find details column: could be 'Details', unnamed, or have spaces
+                                # Usage_Log sheet col 6 has no header — gspread names it '' or similar
+                                if details_col is not None:
+                                    matched = topic_logs[
+                                        topic_logs[details_col].astype(str).str.contains(
+                                            student_id_cls, case=False, na=False
+                                        )
+                                    ]
+                                    if not matched.empty:
+                                        has_topic = True
+                                        topic_timestamp = str(matched.iloc[0].get('Timestamp', ''))
+                                    else:
+                                        has_topic = True
+                                        topic_timestamp = str(topic_logs.iloc[0].get('Timestamp', ''))
                                 else:
-                                    # Fall back: any completion by this tutor on this date counts
-                                    has_topic = True
-                                    topic_timestamp = str(topic_logs.iloc[0].get('Timestamp', ''))
+                                    # Try searching all string columns for the student ID
+                                    found_in_any = False
+                                    for col in topic_logs.columns:
+                                        try:
+                                            m = topic_logs[topic_logs[col].astype(str).str.contains(
+                                                student_id_cls, case=False, na=False)]
+                                            if not m.empty:
+                                                has_topic = True
+                                                topic_timestamp = str(m.iloc[0].get('Timestamp', ''))
+                                                found_in_any = True
+                                                break
+                                        except Exception:
+                                            continue
+                                    if not found_in_any:
+                                        # Any completion by tutor on that date counts
+                                        has_topic = True
+                                        topic_timestamp = str(topic_logs.iloc[0].get('Timestamp', ''))
 
                         if has_memo and has_topic:
                             status = '✅ Complete'
@@ -1464,7 +1501,7 @@ def show_admin_panel():
 
                             detail_rows.append({
                                 'Class Date': cls_date_obj.strftime('%d/%m/%Y') if cls_date_obj else str(cls.get('Date', '')),
-                                'Time': f"{cls.get('Start_Time', 'N/A')} – {cls.get('End_Time', 'N/A')}",
+                                'Time': str(cls.get('Start_Time', 'N/A')),
                                 'Student': student_name,
                                 'Student ID': student_id_cls,
                                 'Subject': subject_cls,
