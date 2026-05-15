@@ -434,33 +434,103 @@ def formatDate(date_val):
     
     return date_str
 
-def save_tutor_memo(student_id, class_date, memo_text):
-    """Save tutor memo to the Schedule sheet"""
+def save_class_update(student_id, class_date, updates):
+    """Save class update (memo + homework + attendance + topic count) to Schedule sheet.
+    `updates` is a dict like:
+        {
+            'Tutor_Memo': str,
+            'Homework_Checked': 'Yes' / 'No',
+            'Student_Attendance': 'Present' / 'Absent',
+            'Topics_Completed': int (optional)
+        }
+    Only keys present in `updates` are written. Missing columns in the sheet are skipped
+    silently (so adding new tracking fields is non-breaking).
+    """
     try:
         client = get_google_sheets_client()
+        if not client:
+            return False, "Cannot connect to Google Sheets"
         spreadsheet = client.open_by_key(st.secrets["spreadsheet_id"])
         worksheet = spreadsheet.worksheet("Schedule")
-        
+
         data = worksheet.get_all_records()
-        
+        headers = worksheet.row_values(1)
+
         for idx, row in enumerate(data):
-            if (str(row.get('Student_ID')).strip() == str(student_id).strip() and 
+            if (str(row.get('Student_ID')).strip() == str(student_id).strip() and
                 str(row.get('Date')).strip() == str(class_date).strip()):
-                
-                row_num = idx + 2
-                
-                headers = worksheet.row_values(1)
-                if 'Tutor_Memo' in headers:
-                    memo_col = headers.index('Tutor_Memo') + 1
-                    worksheet.update_cell(row_num, memo_col, memo_text)
-                    st.cache_data.clear()
-                    return True, "Memo saved successfully!"
-                else:
-                    return False, "Tutor_Memo column not found in Schedule sheet"
-        
+
+                row_num = idx + 2  # +1 for header, +1 for 1-based indexing
+
+                # Build batch update list
+                batch = []
+                missing_cols = []
+                for col_name, value in updates.items():
+                    if col_name in headers:
+                        col_idx = headers.index(col_name) + 1
+                        batch.append({
+                            'range': gspread.utils.rowcol_to_a1(row_num, col_idx),
+                            'values': [[str(value) if value is not None else '']]
+                        })
+                    else:
+                        missing_cols.append(col_name)
+
+                if not batch:
+                    return False, f"None of the columns exist in Schedule sheet. Please add: {', '.join(missing_cols)}"
+
+                worksheet.batch_update(batch)
+                st.cache_data.clear()
+                load_sheet_data.clear()
+
+                msg = "Class update saved!"
+                if missing_cols:
+                    msg += f" (Skipped: {', '.join(missing_cols)} — column missing in Schedule)"
+                return True, msg
+
         return False, "Class not found in schedule"
     except Exception as e:
-        return False, f"Error saving memo: {str(e)}"
+        import traceback
+        traceback.print_exc()
+        return False, f"Error saving: {str(e)}"
+
+
+# Backward-compatible wrapper (other code paths might still call save_tutor_memo)
+def save_tutor_memo(student_id, class_date, memo_text):
+    return save_class_update(student_id, class_date, {'Tutor_Memo': memo_text})
+
+
+def count_topics_for_student_on_date(student_id, tutor_id, class_date):
+    """Return how many topics have been marked completed in Progress_Tracker
+    for this student by this tutor on this class date.
+    Used to keep Schedule.Topics_Completed in sync."""
+    try:
+        progress = read_progress_tracker_fresh()
+        if progress is None or progress.empty:
+            return 0
+
+        # Match by student. Date_Completed format in sheet is dd/mm/yyyy.
+        # We accept either exact match or just count completions for this student by this tutor.
+        cls_date_parsed = parse_date(str(class_date))
+        target_date_str = cls_date_parsed.strftime('%d/%m/%Y') if cls_date_parsed else str(class_date).strip()
+
+        filtered = progress[
+            (progress['Student_ID'].astype(str).str.strip() == str(student_id).strip()) &
+            (progress['Completed_By'].astype(str).str.strip() == str(tutor_id).strip()) &
+            (progress['Date_Completed'].astype(str).str.strip() == target_date_str)
+        ]
+        return len(filtered)
+    except Exception:
+        return 0
+
+
+def update_topics_count_in_schedule(student_id, tutor_id, class_date):
+    """After a topic is marked complete, refresh the Topics_Completed count
+    in the matching Schedule row. Silent no-op if Topics_Completed column missing."""
+    try:
+        count = count_topics_for_student_on_date(student_id, tutor_id, class_date)
+        save_class_update(student_id, class_date, {'Topics_Completed': count})
+    except Exception as e:
+        print(f"update_topics_count_in_schedule error: {e}")
 
 def mark_topic_complete(plan_id, tutor_id):
     """Mark a topic as completed - saves to Progress_Tracker sheet"""
@@ -769,13 +839,15 @@ def show_dashboard():
                     st.markdown("---")
     
     with tab3:
-        past_classes = classes_df[classes_df['Date'].apply(lambda x: False if parse_date(x) is None else (parse_date(x) < today))]
-        past_classes = past_classes.sort_values('Date', ascending=False)
+        past_classes = classes_df[classes_df['Date'].apply(lambda x: False if parse_date(x) is None else (parse_date(x) < today))].copy()
+        # Sort chronologically by parsed date (NOT by string) so most recent shows first
+        past_classes['_parsed_date'] = past_classes['Date'].apply(parse_date)
+        past_classes = past_classes.sort_values('_parsed_date', ascending=False)
         
         if past_classes.empty:
             st.info("No past classes found")
         else:
-            recent_past = past_classes.head(50)
+            recent_past = past_classes.head(100)
             
             for date_val in recent_past['Date'].unique():
                 date_obj = parse_date(date_val)
@@ -795,80 +867,153 @@ def show_dashboard():
                     st.markdown("---")
 
 def show_class_card(cls, unique_key):
-    """Display a class card"""
+    """Display a class card with status indicators for memo / homework / attendance."""
     with st.container():
         st.markdown('<div class="class-card">', unsafe_allow_html=True)
-        
+
         col1, col2 = st.columns([3, 1])
-        
+
+        # Compute status indicators
+        memo_val = str(cls.get('Tutor_Memo', '')).strip()
+        has_memo = memo_val and memo_val.lower() not in ('nan', 'none', '')
+
+        hw_val = str(cls.get('Homework_Checked', '')).strip().lower()
+        hw_checked = hw_val in ('yes', 'true', '1', 'y')
+
+        att_val = str(cls.get('Student_Attendance', '')).strip().lower()
+        if att_val in ('present', 'p', 'yes', '1'):
+            attendance_status = 'present'
+        elif att_val in ('absent', 'a', 'no', '0'):
+            attendance_status = 'absent'
+        else:
+            attendance_status = 'unmarked'
+
+        topics_done = str(cls.get('Topics_Completed', '')).strip()
+        topics_done_int = 0
+        try:
+            topics_done_int = int(float(topics_done)) if topics_done and topics_done.lower() not in ('nan', 'none') else 0
+        except ValueError:
+            topics_done_int = 0
+
         with col1:
             st.markdown(f"### {cls.get('Student_Name', cls['Student_ID'])}")
             st.markdown(f"📅 **Date:** {cls['Date']} | 🕐 **Time:** {cls.get('Start_Time', 'N/A')}")
             st.markdown(f"📖 **Subject:** {cls['Subject']}")
             st.markdown(f"🆔 **Student ID:** {cls['Student_ID']}")
-            
-            if pd.notna(cls.get('Tutor_Memo')) and str(cls.get('Tutor_Memo')).strip():
-                st.markdown(f"📝 **Memo:** {cls.get('Tutor_Memo')}")
-        
+
+            # Status row with indicators
+            status_bits = []
+            status_bits.append("📝 Memo ✅" if has_memo else "📝 Memo ⏳")
+            status_bits.append("📚 HW ✅" if hw_checked else "📚 HW ⏳")
+            if attendance_status == 'present':
+                status_bits.append("👤 Present ✅")
+            elif attendance_status == 'absent':
+                status_bits.append("👤 Absent ❌")
+            else:
+                status_bits.append("👤 Attendance ⏳")
+            status_bits.append(f"🎯 Topics: {topics_done_int}")
+            st.markdown(" &nbsp;|&nbsp; ".join(status_bits))
+
+            if has_memo:
+                st.caption(f"📝 *{memo_val}*")
+
         with col2:
-            if st.button("📝 Memo", key=f"memo_{unique_key}", use_container_width=True):
+            if st.button("📋 Class Update", key=f"update_{unique_key}", use_container_width=True):
                 st.session_state.show_memo_dialog = {
                     'student_id': cls['Student_ID'],
                     'student_name': cls.get('Student_Name', cls['Student_ID']),
                     'date': cls['Date'],
-                    'existing_memo': cls.get('Tutor_Memo', '')
+                    'existing_memo': memo_val,
+                    'existing_hw': hw_checked,
+                    'existing_attendance': attendance_status,
                 }
                 st.rerun()
-            
+
             if st.button("View Progress →", key=f"progress_{unique_key}", use_container_width=True):
                 st.session_state.current_view = 'student'
                 st.session_state.selected_student = {
                     'id': cls['Student_ID'],
                     'name': cls.get('Student_Name', cls['Student_ID']),
-                    'subject': cls.get('Subject', '')
+                    'subject': cls.get('Subject', ''),
+                    'date': cls['Date'],  # passed for topics count refresh
                 }
                 st.rerun()
-        
+
         st.markdown('</div>', unsafe_allow_html=True)
 
 def show_memo_dialog():
-    """Show dialog for adding/editing memo"""
-    memo_data = st.session_state.show_memo_dialog
-    
-    st.markdown('<div class="main-header"><h1>📝 Add/Edit Memo</h1></div>', unsafe_allow_html=True)
-    
-    st.markdown(f"### {memo_data['student_name']}")
-    st.markdown(f"📅 **Date:** {memo_data['date']}")
+    """Show unified class update dialog: homework + attendance + memo."""
+    data = st.session_state.show_memo_dialog
+
+    st.markdown('<div class="main-header"><h1>📋 Class Update</h1></div>', unsafe_allow_html=True)
+
+    st.markdown(f"### {data['student_name']}")
+    st.markdown(f"📅 **Date:** {data['date']}")
     st.markdown("---")
-    
-    memo_text = st.text_area(
-        "Class Memo",
-        value=memo_data.get('existing_memo', ''),
-        height=200,
-        placeholder="Enter notes about the class: topics covered, student performance, homework assigned, etc.",
-        help="This memo will be saved to the Schedule sheet"
+
+    # Homework check
+    st.markdown("#### 📚 Homework")
+    hw_checked = st.checkbox(
+        "Homework was checked at the start of class",
+        value=bool(data.get('existing_hw', False)),
+        help="Tick this if you reviewed the student's homework"
     )
-    
+
+    st.markdown("---")
+
+    # Attendance
+    st.markdown("#### 👤 Student Attendance")
+    existing_att = data.get('existing_attendance', 'unmarked')
+    att_options = ['Present', 'Absent', 'Not marked yet']
+    default_idx = 0 if existing_att == 'present' else (1 if existing_att == 'absent' else 2)
+    attendance = st.radio(
+        "Was the student present?",
+        att_options,
+        index=default_idx,
+        horizontal=True,
+    )
+
+    st.markdown("---")
+
+    # Memo
+    st.markdown("#### 📝 Class Memo")
+    memo_text = st.text_area(
+        "Notes about the class",
+        value=data.get('existing_memo', ''),
+        height=180,
+        placeholder="Topics covered, student performance, homework assigned, etc.",
+    )
+
+    st.markdown("---")
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
-        if st.button("💾 Save Memo", use_container_width=True):
-            if memo_text.strip():
-                success, message = save_tutor_memo(
-                    memo_data['student_id'],
-                    memo_data['date'],
-                    memo_text.strip()
+        if st.button("💾 Save All", use_container_width=True, type="primary"):
+            updates = {
+                'Tutor_Memo': memo_text.strip(),
+                'Homework_Checked': 'Yes' if hw_checked else 'No',
+            }
+            if attendance == 'Present':
+                updates['Student_Attendance'] = 'Present'
+            elif attendance == 'Absent':
+                updates['Student_Attendance'] = 'Absent'
+            # If "Not marked yet" — don't overwrite existing value
+
+            with st.spinner('Saving to sheet...'):
+                success, message = save_class_update(
+                    data['student_id'],
+                    data['date'],
+                    updates
                 )
-                
-                if success:
-                    st.success(message)
-                    st.session_state.show_memo_dialog = None
-                    st.rerun()
-                else:
-                    st.error(message)
+
+            if success:
+                st.success(message)
+                st.session_state.show_memo_dialog = None
+                st.rerun()
             else:
-                st.warning("Please enter a memo before saving")
-    
+                st.error(message)
+
     with col2:
         if st.button("Cancel", use_container_width=True):
             st.session_state.show_memo_dialog = None
@@ -1807,6 +1952,21 @@ def show_student_plan():
                         success, message = mark_topic_complete(plan_id, st.session_state.tutor_id)
                     if success:
                         st.session_state.locally_completed.add(plan_id)
+
+                        # Refresh Topics_Completed count in Schedule sheet
+                        # so admin panel and class card show the updated total
+                        class_date = st.session_state.get('selected_student', {}).get('date', '')
+                        if class_date:
+                            try:
+                                student_id_for_count = plan_id.split('|||')[0]
+                                update_topics_count_in_schedule(
+                                    student_id_for_count,
+                                    st.session_state.tutor_id,
+                                    class_date
+                                )
+                            except Exception as e:
+                                print(f"Topics count update failed: {e}")
+
                         st.cache_data.clear()
                         load_sheet_data.clear()
                         st.toast(f"✅ {message}", icon="✅")
