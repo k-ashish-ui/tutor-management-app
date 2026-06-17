@@ -256,19 +256,35 @@ def get_tutor_classes(tutor_id):
     return tutor_classes
 
 def parse_date(date_str):
-    """Parse date from various formats"""
+    """Parse date from various formats commonly found in the sheets."""
     if pd.isna(date_str):
         return None
-    
+
     date_str = str(date_str).strip()
-    formats = ['%d/%m/%Y', '%Y-%m-%d', '%m/%d/%Y', '%d-%m-%Y']
-    
+    if not date_str or date_str.lower() in ('nan', 'none'):
+        return None
+
+    # Order matters: list unambiguous formats first, then ambiguous ones.
+    # yyyy-prefixed formats are tried first since they can't be mistaken for dd/mm.
+    formats = [
+        '%Y-%m-%d',     # 2026-05-12
+        '%Y/%m/%d',     # 2026/05/12   <- newly added
+        '%Y.%m.%d',     # 2026.05.12
+        '%d/%m/%Y',     # 12/05/2026
+        '%d-%m-%Y',     # 12-05-2026
+        '%d.%m.%Y',     # 12.05.2026
+        '%m/%d/%Y',     # 05/12/2026 (US style — last resort)
+        '%d/%m/%y',     # 12/05/26 (2-digit year)
+        '%Y-%m-%d %H:%M:%S',  # full timestamps
+        '%Y/%m/%d %H:%M:%S',
+    ]
+
     for fmt in formats:
         try:
             return datetime.strptime(date_str, fmt).date()
-        except:
+        except ValueError:
             continue
-    
+
     return None
 
 def read_progress_tracker_fresh():
