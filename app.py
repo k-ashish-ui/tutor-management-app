@@ -218,6 +218,18 @@ def authenticate_admin(password):
     admin_password = st.secrets.get("admin_password", "admin123")
     return password == admin_password
 
+def get_tutor_name(tutor_id):
+    """Return the tutor's display name for a given ID, or the ID if not found."""
+    tutors_df = load_sheet_data("Tutors")
+    if tutors_df is None or tutors_df.empty or 'Tutor_ID' not in tutors_df.columns:
+        return str(tutor_id)
+    row = tutors_df[tutors_df['Tutor_ID'].astype(str).str.strip() == str(tutor_id).strip()]
+    if row.empty or 'Name' not in tutors_df.columns:
+        return str(tutor_id)
+    name = str(row.iloc[0]['Name']).strip()
+    return name if name and name.lower() != 'nan' else str(tutor_id)
+
+
 def get_tutor_classes(tutor_id):
     """Get all classes for a specific tutor"""
     schedule_df = load_sheet_data("Schedule")
@@ -225,8 +237,27 @@ def get_tutor_classes(tutor_id):
     if schedule_df is None or schedule_df.empty:
         return pd.DataFrame()
     
-    tutor_classes = schedule_df[schedule_df['Tutor_ID'].astype(str).str.strip() == str(tutor_id).strip()].copy()
-    
+    tid = str(tutor_id).strip()
+
+    # Classes assigned to this tutor
+    assigned_mask = schedule_df['Tutor_ID'].astype(str).str.strip() == tid
+
+    # Classes this tutor COVERED as a substitute (Actual_Tutor stores "Name (ID)")
+    if 'Actual_Tutor' in schedule_df.columns:
+        # Match the ID inside the "Name (ID)" string, OR an exact ID match
+        covered_mask = schedule_df['Actual_Tutor'].astype(str).str.contains(
+            rf"\b{tid}\b", case=False, na=False, regex=True
+        )
+    else:
+        covered_mask = pd.Series([False] * len(schedule_df), index=schedule_df.index)
+
+    tutor_classes = schedule_df[assigned_mask | covered_mask].copy()
+
+    # Flag which ones were covered (assigned to someone else) so the card can show it
+    tutor_classes['_is_covered_by_me'] = (
+        covered_mask[tutor_classes.index] & ~assigned_mask[tutor_classes.index]
+    )
+
     students_df = load_sheet_data("Students ")
     if students_df is None or students_df.empty:
         students_df = load_sheet_data("Students")
@@ -562,7 +593,12 @@ def save_substitute_class(student_id, class_date, actual_tutor_id, updates):
     `updates` carries memo / homework / attendance just like save_class_update.
     """
     full_updates = dict(updates)
-    full_updates['Actual_Tutor'] = str(actual_tutor_id)
+    # Store as "Name (ID)" so it's human-readable in the sheet but still traceable
+    actual_name = get_tutor_name(actual_tutor_id)
+    if actual_name != str(actual_tutor_id):
+        full_updates['Actual_Tutor'] = f"{actual_name} ({actual_tutor_id})"
+    else:
+        full_updates['Actual_Tutor'] = str(actual_tutor_id)
     return save_class_update(student_id, class_date, full_updates)
 
 
@@ -890,7 +926,14 @@ def show_dashboard():
             else:
                 # Exclude classes already assigned to me (those are shown above)
                 my_id = str(st.session_state.tutor_id).strip()
+                # Exclude classes already assigned to me
                 others = all_today[all_today['Tutor_ID'].astype(str).str.strip() != my_id].copy()
+                # Also exclude classes I've ALREADY covered (they now show in my main list)
+                if 'Actual_Tutor' in others.columns:
+                    already_covered = others['Actual_Tutor'].astype(str).str.contains(
+                        rf"\b{my_id}\b", case=False, na=False, regex=True
+                    )
+                    others = others[~already_covered].copy()
 
                 if others.empty:
                     st.info("All of today's classes are already assigned to you.")
@@ -1009,8 +1052,15 @@ def show_class_card(cls, unique_key):
         except ValueError:
             topics_done_int = 0
 
+        is_covered = bool(cls.get('_is_covered_by_me', False))
+
         with col1:
-            st.markdown(f"### {cls.get('Student_Name', cls['Student_ID'])}")
+            header = f"### {cls.get('Student_Name', cls['Student_ID'])}"
+            if is_covered:
+                header += " &nbsp;🔄"
+            st.markdown(header, unsafe_allow_html=True)
+            if is_covered:
+                st.info(f"🔄 You covered this class (originally assigned to {cls.get('Tutor_ID', 'another tutor')})")
             st.markdown(f"📅 **Date:** {cls['Date']} | 🕐 **Time:** {cls.get('Start_Time', 'N/A')}")
             st.markdown(f"📖 **Subject:** {cls['Subject']}")
             st.markdown(f"🆔 **Student ID:** {cls['Student_ID']}")
@@ -1033,7 +1083,7 @@ def show_class_card(cls, unique_key):
 
         with col2:
             if st.button("📋 Class Update", key=f"update_{unique_key}", use_container_width=True):
-                st.session_state.show_memo_dialog = {
+                dialog_data = {
                     'student_id': cls['Student_ID'],
                     'student_name': cls.get('Student_Name', cls['Student_ID']),
                     'date': cls['Date'],
@@ -1041,6 +1091,11 @@ def show_class_card(cls, unique_key):
                     'existing_hw': hw_checked,
                     'existing_attendance': attendance_status,
                 }
+                # If this is a class I covered as substitute, keep saving as substitute
+                if is_covered:
+                    dialog_data['is_substitute'] = True
+                    dialog_data['assigned_tutor'] = str(cls.get('Tutor_ID', ''))
+                st.session_state.show_memo_dialog = dialog_data
                 st.rerun()
 
             if st.button("View Progress →", key=f"progress_{unique_key}", use_container_width=True):
