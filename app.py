@@ -255,6 +255,46 @@ def get_tutor_classes(tutor_id):
     
     return tutor_classes
 
+
+def get_all_classes_for_date(target_date):
+    """Return ALL classes scheduled on a given date, regardless of assigned tutor.
+    Used for the substitute-tutor flow so a tutor can pick up a class that
+    wasn't originally assigned to them. target_date is a datetime.date."""
+    schedule_df = load_sheet_data("Schedule")
+    if schedule_df is None or schedule_df.empty:
+        return pd.DataFrame()
+
+    day_classes = schedule_df[
+        schedule_df['Date'].apply(lambda x: parse_date(x) == target_date)
+    ].copy()
+
+    if day_classes.empty:
+        return day_classes
+
+    # Attach student names (same subject-aware logic as get_tutor_classes)
+    students_df = load_sheet_data("Students ")
+    if students_df is None or students_df.empty:
+        students_df = load_sheet_data("Students")
+
+    if students_df is not None and not students_df.empty:
+        def get_student_name(row):
+            sid = str(row['Student_ID']).strip()
+            subj = str(row.get('Subject', '')).strip()
+            if subj and 'Subject' in students_df.columns:
+                m = students_df[
+                    (students_df['Student_ID'].astype(str).str.strip() == sid) &
+                    (students_df['Subject'].astype(str).str.strip() == subj)
+                ]
+                if not m.empty and 'Student_Name' in m.columns:
+                    return str(m.iloc[0]['Student_Name']).strip()
+            m = students_df[students_df['Student_ID'].astype(str).str.strip() == sid]
+            if not m.empty and 'Student_Name' in m.columns:
+                return str(m.iloc[0]['Student_Name']).strip()
+            return sid
+        day_classes['Student_Name'] = day_classes.apply(get_student_name, axis=1)
+
+    return day_classes
+
 def parse_date(date_str):
     """Parse date from various formats commonly found in the sheets."""
     if pd.isna(date_str):
@@ -513,6 +553,17 @@ def save_class_update(student_id, class_date, updates):
 # Backward-compatible wrapper (other code paths might still call save_tutor_memo)
 def save_tutor_memo(student_id, class_date, memo_text):
     return save_class_update(student_id, class_date, {'Tutor_Memo': memo_text})
+
+
+def save_substitute_class(student_id, class_date, actual_tutor_id, updates):
+    """Record that `actual_tutor_id` taught a class originally assigned to someone else.
+    Writes Actual_Tutor into the original Schedule row WITHOUT touching the
+    assigned Tutor_ID — so payment can compare assigned vs actual later.
+    `updates` carries memo / homework / attendance just like save_class_update.
+    """
+    full_updates = dict(updates)
+    full_updates['Actual_Tutor'] = str(actual_tutor_id)
+    return save_class_update(student_id, class_date, full_updates)
 
 
 def count_topics_for_student_on_date(student_id, tutor_id, class_date):
@@ -827,6 +878,53 @@ def show_dashboard():
             st.markdown(f"### 📆 {today.strftime('%A, %B %d, %Y')}")
             for _, cls in today_classes.iterrows():
                 show_class_card(cls, f"today_{_}")
+
+        # ── Substitute / Covered class flow ──────────────────────────────────
+        st.markdown("---")
+        with st.expander("🔄 Did you cover a class that isn't shown above?"):
+            st.caption("If you taught a student today whose class was assigned to another tutor, select it here. The original assignment stays unchanged — your name is recorded as the actual tutor.")
+
+            all_today = get_all_classes_for_date(today)
+            if all_today.empty:
+                st.info("No classes are scheduled at all for today.")
+            else:
+                # Exclude classes already assigned to me (those are shown above)
+                my_id = str(st.session_state.tutor_id).strip()
+                others = all_today[all_today['Tutor_ID'].astype(str).str.strip() != my_id].copy()
+
+                if others.empty:
+                    st.info("All of today's classes are already assigned to you.")
+                else:
+                    # Build readable labels for the dropdown
+                    def label_for(row):
+                        name = row.get('Student_Name', row['Student_ID'])
+                        subj = row.get('Subject', '')
+                        assigned = row.get('Tutor_ID', '')
+                        tm = row.get('Start_Time', '')
+                        return f"{name} — {subj} @ {tm} (assigned: {assigned})"
+
+                    others['_label'] = others.apply(label_for, axis=1)
+                    label_to_row = {r['_label']: r for _, r in others.iterrows()}
+
+                    selected_label = st.selectbox(
+                        "Select the class you covered",
+                        options=list(label_to_row.keys()),
+                        key="substitute_select"
+                    )
+
+                    if st.button("📋 Fill update for this class", key="substitute_open", use_container_width=True):
+                        chosen = label_to_row[selected_label]
+                        st.session_state.show_memo_dialog = {
+                            'student_id': chosen['Student_ID'],
+                            'student_name': chosen.get('Student_Name', chosen['Student_ID']),
+                            'date': chosen['Date'],
+                            'existing_memo': str(chosen.get('Tutor_Memo', '')),
+                            'existing_hw': str(chosen.get('Homework_Checked', '')).strip().lower() in ('yes','true','1','y'),
+                            'existing_attendance': 'present' if str(chosen.get('Student_Attendance','')).strip().lower() in ('present','p','yes','1') else ('absent' if str(chosen.get('Student_Attendance','')).strip().lower() in ('absent','a','no','0') else 'unmarked'),
+                            'is_substitute': True,
+                            'assigned_tutor': str(chosen.get('Tutor_ID', '')),
+                        }
+                        st.rerun()
     
     with tab2:
         upcoming_classes = classes_df[classes_df['Date'].apply(
@@ -965,6 +1063,14 @@ def show_memo_dialog():
 
     st.markdown(f"### {data['student_name']}")
     st.markdown(f"📅 **Date:** {data['date']}")
+
+    if data.get('is_substitute'):
+        st.warning(
+            f"🔄 **Substitute / Covered class.** This class was assigned to "
+            f"**{data.get('assigned_tutor', 'another tutor')}**. "
+            f"You ({st.session_state.tutor_id}) will be recorded as the actual tutor. "
+            f"The original assignment stays unchanged."
+        )
     st.markdown("---")
 
     # Homework check
@@ -1017,11 +1123,19 @@ def show_memo_dialog():
             # If "Not marked yet" — don't overwrite existing value
 
             with st.spinner('Saving to sheet...'):
-                success, message = save_class_update(
-                    data['student_id'],
-                    data['date'],
-                    updates
-                )
+                if data.get('is_substitute'):
+                    success, message = save_substitute_class(
+                        data['student_id'],
+                        data['date'],
+                        st.session_state.tutor_id,
+                        updates
+                    )
+                else:
+                    success, message = save_class_update(
+                        data['student_id'],
+                        data['date'],
+                        updates
+                    )
 
             if success:
                 st.success(message)
@@ -1660,6 +1774,14 @@ def show_admin_panel():
                             if memo_text in ('nan', 'none', 'None'):
                                 memo_text = ''
 
+                            actual_tutor = str(cls.get('Actual_Tutor', '')).strip()
+                            covered_note = ''
+                            if actual_tutor and actual_tutor.lower() not in ('nan', 'none', ''):
+                                if actual_tutor != tutor_id:
+                                    covered_note = f"⚠️ Covered by {actual_tutor}"
+                                else:
+                                    covered_note = "✅ Taught (substitute)"
+
                             detail_rows.append({
                                 'Class Date': cls_date_obj.strftime('%d/%m/%Y') if cls_date_obj else str(cls.get('Date', '')),
                                 'Time': str(cls.get('Start_Time', 'N/A')),
@@ -1667,6 +1789,9 @@ def show_admin_panel():
                                 'Student ID': student_id_cls,
                                 'Subject': subject_cls,
                                 'Status': status,
+                                'Assigned Tutor': tutor_id,
+                                'Actual Tutor': actual_tutor if actual_tutor and actual_tutor.lower() not in ('nan','none') else '—',
+                                'Substitute?': covered_note if covered_note else '—',
                                 '📚 Topic Marked At': topic_ts if has_topic else '—',
                                 '📝 Memo': '✅ Yes' if has_memo else '❌ No',
                                 'Memo Text': memo_text if memo_text else '—',
